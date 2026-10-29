@@ -44,7 +44,36 @@ The history database is a separate file that only this service writes, so
 n8n's pruning never touches it: executions you imported last month are still
 here after n8n has forgotten them.
 
-## Install (10 minutes)
+## Quick start (one command)
+
+On the machine where n8n runs:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/<user>/n8n-execution-viewer/main/install.sh | sudo bash -s --
+```
+
+The installer will:
+
+1. **Find n8n's SQLite database** (official Docker volume path, then
+   `docker inspect` of a running n8n container, then it asks). Pass
+   `--n8n-db PATH` to skip detection.
+2. Copy the frontend to `/var/www/n8n-viewer/` and the backend to
+   `/opt/n8n-execution-viewer/`.
+3. Create and start the `n8n-viewer.service` systemd unit (loopback API,
+   first run backfills the history, then it syncs every 5 minutes).
+4. Print the exact two lines to add to your Apache vhost (or patch it
+   itself, with a timestamped backup, a managed block and a configtest,
+   if you pass `--apache-conf /path/to/vhost.conf` — optional `--vhost-port`).
+
+Re-running it updates the code and never touches the history database.
+Remove it later with `sudo bash install.sh --uninstall` (the history
+stays on disk on purpose). Other options: `--dry-run`, `--port`,
+`--bind`, `--sync-interval`, `--no-systemd`, `--help`.
+
+Prefer to do it by hand? The manual install below is exactly what the
+script does, step by step.
+
+## Manual install
 
 ### 1. Frontend
 
