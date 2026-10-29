@@ -191,7 +191,13 @@ Open `https://your-host/n8n-viewer/`.
 
 ### Branding (logo and title)
 
-Drop an optional `brand.json` next to `index.html` (in your web root):
+Two ways, in order of precedence:
+
+1. **Settings panel** (recommended): gear icon → *Marca* → title,
+   subtitle and logo upload. Saved via the API to `config.json` next to
+   the history database (survives restarts and image rebuilds).
+2. **Static file**: drop a `brand.json` next to `index.html` (in your web
+   root). Used only when the settings panel has not saved a brand:
 
 ```json
 { "title": "Mi Empresa", "subtitle": "historial de n8n", "logo": "logo.png", "favicon": "favicon.png" }
@@ -227,6 +233,15 @@ retention in the card label.
 - `GET /api/sync` — running/step/last run result
 - `POST /api/sync` (header `x-viewer-action: sync`) — trigger a sync now;
   `409` while one is running
+- `GET /api/config` — current `retentionDays` + `brand` (title/subtitle/logo)
+- `POST /api/config` (header `x-viewer-action: config`, JSON body
+  `{retentionDays?, brand?}`) — update them; persists to `config.json` next
+  to the history DB; `400` on invalid values, `403` without the header
+
+The **settings panel** (gear icon in the header) edits both through that
+endpoint: the retention period (how long executions are kept in the
+history) and the brand (title, subtitle, logo upload). The workflow
+sidebar is sorted by execution count (most executed first).
 
 Dates are passed through verbatim as n8n stores them
 (`YYYY-MM-DD HH:mm:ss.mmm`); the viewer renders them in your local

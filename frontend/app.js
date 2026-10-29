@@ -325,7 +325,8 @@ function renderDisk(st) {
 function renderWorkflows() {
   const filter = $("wf-filter").value.trim().toLowerCase();
   const visible = state.workflows
-    .filter((w) => !filter || String(w.name).toLowerCase().includes(filter) || w.id.toLowerCase().includes(filter));
+    .filter((w) => !filter || String(w.name).toLowerCase().includes(filter) || w.id.toLowerCase().includes(filter))
+    .sort((a, b) => b.total - a.total || String(a.name).localeCompare(String(b.name)));
   $("wf-count").textContent = `${visible.length} de ${state.workflows.length}`;
   setChildren($("wf-list"), ...visible.map((w) => el("li", {},
     el("button", {
@@ -872,15 +873,20 @@ async function applyHash() {
   if (h.node && (h.node !== state.node || h.run !== state.run)) return selectNode(h.node, h.run);
 }
 
-// S8: optional brand.json next to index.html:
-// {"title": "...", "subtitle": "...", "logo": "logo.png", "favicon": "favicon.png"}
-// Missing file or missing field = the current default. No backend involved.
+// S8/S9: branding. /api/config (the settings UI) wins; the optional static
+// brand.json next to index.html is the fallback.
 async function applyBrand() {
   let brand = null;
   try {
-    const r = await fetch("brand.json", { cache: "no-cache" });
-    if (r.ok) brand = await r.json();
-  } catch { /* no brand file: keep defaults */ }
+    const cfg = await api("/api/config");
+    if (cfg && cfg.brand) brand = cfg.brand;
+  } catch { /* no config (old backend) or API down: try the static file */ }
+  if (!brand) {
+    try {
+      const r = await fetch("brand.json", { cache: "no-cache" });
+      if (r.ok) brand = await r.json();
+    } catch { /* no brand: keep defaults */ }
+  }
   if (!brand) return;
   const title = $("brand-title"), sub = $("brand-sub");
   if (brand.title && title) title.textContent = brand.title;
@@ -905,9 +911,130 @@ async function applyBrand() {
   }
 }
 
+// ---------- S9: settings (retention + brand) ----------
+
+const RETENTION_CUSTOM = "custom";
+
+function setSettingsMsg(text, isErr) {
+  const msg = $("settings-msg");
+  msg.textContent = text || "";
+  msg.classList.toggle("err", !!isErr);
+}
+
+async function openSettings() {
+  $("settings-overlay").hidden = false;
+  setSettingsMsg("");
+  $("settings-save").disabled = true;
+  try {
+    const cfg = await api("/api/config");
+    const days = cfg.retentionDays ?? 0;
+    const sel = $("cfg-retention");
+    if ([...sel.options].some((o) => o.value === String(days))) sel.value = String(days);
+    else { sel.value = RETENTION_CUSTOM; $("cfg-retention-custom").value = days; }
+    $("cfg-retention-custom").hidden = sel.value !== RETENTION_CUSTOM;
+    const b = cfg.brand || {};
+    $("cfg-title").value = b.title || "";
+    $("cfg-subtitle").value = b.subtitle || "";
+    showLogoPreview(b.logo || null);
+  } catch (e) {
+    setSettingsMsg(`No se pudieron cargar: ${e.message}`, true);
+    return;
+  }
+  $("settings-save").disabled = false;
+}
+
+function closeSettings() { $("settings-overlay").hidden = true; }
+
+function showLogoPreview(dataUrl) {
+  const img = $("cfg-logo-preview");
+  const clear = $("cfg-logo-clear");
+  if (dataUrl) { img.src = dataUrl; img.hidden = false; clear.hidden = false; }
+  else { img.hidden = true; img.removeAttribute("src"); clear.hidden = true; }
+}
+
+let pendingLogo = null; // dataURL chosen in this session, not yet saved
+
+function currentLogoDataUrl() {
+  return pendingLogo; // null = clear
+}
+
+async function saveSettings() {
+  const sel = $("cfg-retention");
+  let days;
+  if (sel.value === RETENTION_CUSTOM) {
+    days = parseInt($("cfg-retention-custom").value, 10);
+    if (!Number.isInteger(days) || days < 1 || days > 36500) {
+      return setSettingsMsg("Días personalizados: entero entre 1 y 36500.", true);
+    }
+  } else {
+    days = parseInt(sel.value, 10);
+  }
+  const payload = {
+    retentionDays: days,
+    brand: {
+      title: $("cfg-title").value.trim(),
+      subtitle: $("cfg-subtitle").value.trim(),
+      logo: currentLogoDataUrl(),
+    },
+  };
+  $("settings-save").disabled = true;
+  setSettingsMsg("");
+  try {
+    const res = await fetch(API_BASE + "api/config", {
+      method: "POST",
+      headers: { "x-viewer-action": "config", "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+    pendingLogo = null;
+    await applyBrand();
+    await loadStats(); // refresh the disk card label (retention)
+    setSettingsMsg("Guardado.");
+    setTimeout(closeSettings, 400);
+  } catch (e) {
+    setSettingsMsg(`Error al guardar: ${e.message}`, true);
+  } finally {
+    $("settings-save").disabled = false;
+  }
+}
+
+function initSettings() {
+  $("settings-btn").addEventListener("click", openSettings);
+  $("settings-close").addEventListener("click", closeSettings);
+  $("settings-save").addEventListener("click", saveSettings);
+  $("settings-overlay").addEventListener("click", (e) => {
+    if (e.target.id === "settings-overlay") closeSettings();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("settings-overlay").hidden) closeSettings();
+  });
+  $("cfg-retention").addEventListener("change", (e) => {
+    $("cfg-retention-custom").hidden = e.target.value !== RETENTION_CUSTOM;
+  });
+  $("cfg-logo-file").addEventListener("change", (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) {
+      setSettingsMsg("El logo pesa más de 2 MB; elegí uno más chico.", true);
+      e.target.value = "";
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => { pendingLogo = reader.result; showLogoPreview(pendingLogo); setSettingsMsg(""); };
+    reader.readAsDataURL(file);
+  });
+  $("cfg-logo-clear").addEventListener("click", () => {
+    pendingLogo = null;
+    $("cfg-logo-file").value = "";
+    showLogoPreview(null);
+  });
+}
+
 window.addEventListener("popstate", applyHash);
 
 (async () => {
+  initSettings();
   await Promise.all([loadStats(), loadWorkflows()]);
   await applyBrand();
   await applyHash();

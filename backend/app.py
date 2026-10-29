@@ -38,7 +38,68 @@ CONFIG = {
     "sync_interval": int(os.environ.get("N8N_VIEWER_SYNC_INTERVAL", "300")),
     "page_size": int(os.environ.get("N8N_VIEWER_PAGE_SIZE", "50")),
     "retention_days": int(os.environ.get("N8N_VIEWER_RETENTION_DAYS", "0")),
+    "brand": None,  # set from config.json at startup, or via POST /api/config
 }
+
+MAX_CONFIG_BYTES = 2 * 1024 * 1024  # logo data-URLs are the only big payload
+
+
+def _config_file():
+    return os.path.join(os.path.dirname(os.path.abspath(CONFIG["history_db"])),
+                        "config.json")
+
+
+def _clean_brand(brand):
+    """Validate/normalize a brand object; None clears it. Raises ValueError."""
+    if brand is None:
+        return None
+    if not isinstance(brand, dict):
+        raise ValueError("brand must be an object")
+    out = {}
+    for key in ("title", "subtitle"):
+        v = brand.get(key)
+        if v is None:
+            continue
+        if not isinstance(v, str) or len(v) > 200:
+            raise ValueError(f"brand.{key} must be a string of at most 200 chars")
+        out[key] = v
+    v = brand.get("logo")
+    if v is not None:
+        if (not isinstance(v, str) or not v.startswith("data:image/")
+                or len(v) > MAX_CONFIG_BYTES):
+            raise ValueError("brand.logo must be a data:image/ URL of at most 2 MB")
+        out["logo"] = v
+    return out or None
+
+
+def _save_config_file():
+    data = {"retentionDays": CONFIG["retention_days"], "brand": CONFIG.get("brand")}
+    path = _config_file()
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def load_config_file():
+    """Startup: the config.json written by the settings UI overrides the
+    environment defaults (it is the last explicit choice)."""
+    try:
+        with open(_config_file()) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    if (isinstance(data.get("retentionDays"), int)
+            and not isinstance(data["retentionDays"], bool)
+            and data["retentionDays"] >= 0):
+        CONFIG["retention_days"] = data["retentionDays"]
+    if data.get("brand") is not None:
+        try:
+            CONFIG["brand"] = _clean_brand(data["brand"])
+        except ValueError:
+            pass  # a corrupt file must not kill the service
 
 STATUS_FILTER = {"success", "error", "crashed", "canceled", "waiting", "running"}
 
@@ -361,6 +422,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._exec_detail(m.group(1))
             if path == "/api/sync":
                 return self._sync_status()
+            if path == "/api/config":
+                self._send(200, {"retentionDays": CONFIG["retention_days"],
+                                 "brand": CONFIG.get("brand")})
+                return
             self._error(404, "not found")
         except BrokenPipeError:
             pass
@@ -368,13 +433,46 @@ class Handler(BaseHTTPRequestHandler):
             self._error(500, f"{type(e).__name__}: {e}")
 
     def do_POST(self):
-        if urlparse(self.path).path != "/api/sync":
-            return self._error(404, "not found")
-        if self.headers.get("x-viewer-action") != "sync":
-            return self._error(403, "x-viewer-action: sync header required")
-        if not start_sync():
-            return self._error(409, "sync already running")
-        return self._send(200, {"ok": True})
+        path = urlparse(self.path).path
+        if path == "/api/sync":
+            if self.headers.get("x-viewer-action") != "sync":
+                return self._error(403, "x-viewer-action: sync header required")
+            if not start_sync():
+                return self._error(409, "sync already running")
+            return self._send(200, {"ok": True})
+        if path == "/api/config":
+            if self.headers.get("x-viewer-action") != "config":
+                return self._error(403, "x-viewer-action: config header required")
+            return self._save_config()
+        return self._error(404, "not found")
+
+    def _save_config(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length > MAX_CONFIG_BYTES:
+            return self._error(413, "payload too large")
+        try:
+            raw = self.rfile.read(length) if length else b""
+            payload = json.loads(raw.decode() or "null")
+        except (ValueError, UnicodeDecodeError):
+            return self._error(400, "invalid JSON")
+        if not isinstance(payload, dict):
+            return self._error(400, "expected a JSON object")
+        if "retentionDays" in payload:
+            rd = payload["retentionDays"]
+            if isinstance(rd, bool) or not isinstance(rd, int) or rd < 0:
+                return self._error(400, "retentionDays must be an integer >= 0")
+            CONFIG["retention_days"] = rd
+        if "brand" in payload:
+            try:
+                CONFIG["brand"] = _clean_brand(payload["brand"])
+            except ValueError as e:
+                return self._error(400, str(e))
+        _save_config_file()
+        self._send(200, {"retentionDays": CONFIG["retention_days"],
+                         "brand": CONFIG.get("brand")})
 
     # -- endpoint bodies --
 
@@ -629,6 +727,7 @@ def main():
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
     schema.init_history(CONFIG["history_db"])
+    load_config_file()
     set_state("running", "0")
     server = ThreadingHTTPServer((CONFIG["bind"], CONFIG["port"]), Handler)
     threading.Thread(target=sync_loop, daemon=True).start()

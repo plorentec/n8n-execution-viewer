@@ -31,8 +31,8 @@ def http(url):
         return e.code, json.loads(e.read().decode())
 
 
-def http_post(url, headers=None):
-    req = urllib.request.Request(url, method="POST", headers=headers or {})
+def http_post(url, headers=None, data=None):
+    req = urllib.request.Request(url, method="POST", headers=headers or {}, data=data)
     try:
         with urllib.request.urlopen(req, timeout=10) as res:
             return res.status, json.loads(res.read().decode())
@@ -52,6 +52,7 @@ class ApiTestBase(unittest.TestCase):
             "history_db": cls.hist_db,
             "page_size": 50,
             "retention_days": 0,  # reset per class: retention tests mutate it
+            "brand": None,  # reset per class: config tests mutate it
         })
         schema.init_history(cls.hist_db)
         syncmod.run_sync(cls.n8n_db, cls.hist_db)
@@ -333,6 +334,59 @@ class RetentionBase(ApiTestBase):
                         ((now - timedelta(hours=1)).strftime(fmt), eid))
         con.commit()
         con.close()
+
+
+class TestConfig(ApiTestBase):
+    """S9: GET/POST /api/config with persistence in config.json."""
+
+    def config_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(self.hist_db)), "config.json")
+
+    def post_config(self, payload, header=True):
+        headers = {"x-viewer-action": "config"} if header else {}
+        return http_post(self.base + "/api/config", headers=headers,
+                         data=json.dumps(payload).encode())
+
+    def test_get_config_defaults(self):
+        code, body = self.get("/api/config")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["retentionDays"], 0)
+        self.assertIsNone(body["brand"])
+
+    def test_post_retention_applies_and_persists(self):
+        code, body = self.post_config({"retentionDays": 30})
+        self.assertEqual(code, 200)
+        code, body = self.get("/api/config")
+        self.assertEqual(body["retentionDays"], 30)
+        code, stats = self.get("/api/stats")
+        self.assertEqual(stats["retentionDays"], 30)
+        self.assertEqual(stats["storage"]["retentionDays"], 30)
+        with open(self.config_path()) as f:
+            self.assertEqual(json.load(f)["retentionDays"], 30)
+
+    def test_post_brand_roundtrip(self):
+        code, _ = self.post_config({"brand": {"title": "ACME Corp", "subtitle": "ops"}})
+        self.assertEqual(code, 200)
+        code, body = self.get("/api/config")
+        self.assertEqual(body["brand"]["title"], "ACME Corp")
+        self.assertEqual(body["brand"]["subtitle"], "ops")
+        with open(self.config_path()) as f:
+            self.assertEqual(json.load(f)["brand"]["title"], "ACME Corp")
+
+    def test_post_invalid_logo_rejected(self):
+        code, body = self.post_config({"brand": {"logo": "https://ejemplo.com/x.png"}})
+        self.assertEqual(code, 400)
+        self.assertIn("error", body)
+
+    def test_post_without_header_rejected(self):
+        code, body = self.post_config({"retentionDays": 5}, header=False)
+        self.assertEqual(code, 403)
+        self.assertIn("error", body)
+
+    def test_post_invalid_retention_rejected(self):
+        for bad in (-1, "30", None):
+            code, body = self.post_config({"retentionDays": bad})
+            self.assertEqual(code, 400, f"retentionDays={bad!r} should be rejected")
 
 
 class TestRetentionOn(RetentionBase):
