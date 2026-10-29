@@ -73,6 +73,53 @@ stays on disk on purpose). Other options: `--dry-run`, `--port`,
 Prefer to do it by hand? The manual install below is exactly what the
 script does, step by step.
 
+## Docker (if n8n already runs in Docker)
+
+Same code, different packaging: a tiny image that runs **beside** your
+n8n container and reads its data volume **read-only**. No Python on the
+host, no path hunting — the database location is fixed inside the
+image. The n8n side is never touched (the `:ro` mount makes that
+guarantees at the kernel level, not by convention).
+
+```sh
+docker build -t n8n-execution-viewer .     # once, on the host that runs n8n
+docker compose up -d n8n-viewer            # after adding the snippet below
+```
+
+Add this to the compose file that runs your n8n (adjust the volume
+name to yours — the example is `n8n_data`):
+
+```yaml
+services:
+  n8n-viewer:
+    image: n8n-execution-viewer
+    restart: unless-stopped
+    environment:
+      - N8N_DB_PATH=/data/database.sqlite
+    volumes:
+      - n8n_data:/data:ro                 # the same volume your n8n service uses
+      - n8n-viewer_history:/var/lib/n8n-viewer
+    ports:
+      - "127.0.0.1:8391:8391"             # keep on loopback, front it with your proxy
+
+volumes:
+  n8n-viewer_history:
+```
+
+(If your n8n does not use compose, the equivalent `docker run` is in
+`docker-compose.example.yml`'s comments / README issues — the volume
+name is whatever `docker volume ls` shows your n8n using.)
+
+The UI is served by your web server as before: point an `Alias` /
+`alias` at a folder that contains `frontend/`, and proxy
+`/n8n-viewer/api/` to `http://127.0.0.1:8391/api/` (see the two lines
+above).
+
+Why the container runs as root: n8n's volume is owned by uid 1000 with
+`0600` files, so a non-root user could not read the database. The
+image contains exactly three small Python files and nothing else, and
+the n8n mount is read-only.
+
 ## Manual install
 
 ### 1. Frontend

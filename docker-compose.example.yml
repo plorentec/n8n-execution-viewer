@@ -1,0 +1,33 @@
+# Add this to the docker-compose file that runs your n8n
+# (n8n with SQLite, official image). The whole point: the viewer is a
+# sibling container that reads n8n's own volume read-only and keeps a
+# permanent history of every execution, beyond n8n's retention window.
+#
+# Two things must match YOUR stack:
+#   1. the n8n service's data volume name (here: n8n_data) and where
+#      it is mounted inside n8n (/home/node/.n8n in the official image)
+#   2. build the image once on this host first:
+#         docker build -t n8n-execution-viewer .
+#
+# Then: docker compose up -d n8n-viewer
+services:
+  n8n-viewer:
+    image: n8n-execution-viewer
+    restart: unless-stopped
+    environment:
+      # where the SQLite file lives inside the mounted volume
+      - N8N_DB_PATH=/data/database.sqlite
+    volumes:
+      # the SAME volume your n8n service uses, read-only
+      - n8n_data:/data:ro
+      # the viewer's own history (grows forever, independent of n8n)
+      - n8n-viewer_history:/var/lib/n8n-viewer
+    ports:
+      # keep it on loopback and front it with your reverse proxy
+      # (the exact ProxyPass/nginx lines are in the README)
+      - "127.0.0.1:8391:8391"
+
+volumes:
+  n8n-viewer_history:
+  # n8n_data: -> declare it here ONLY if this file is the one that
+  #            creates your n8n service; otherwise leave it to that file
