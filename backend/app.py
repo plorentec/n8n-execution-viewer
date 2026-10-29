@@ -12,13 +12,16 @@ Environment:
   N8N_VIEWER_BIND          bind address (default 127.0.0.1)
   N8N_VIEWER_SYNC_INTERVAL seconds between automatic syncs (default 300)
   N8N_VIEWER_PAGE_SIZE     executions per page (default 50)
+  N8N_VIEWER_RETENTION_DAYS keep history this many days; 0 = keep forever (default)
 """
 import json
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -34,6 +37,7 @@ CONFIG = {
     "bind": os.environ.get("N8N_VIEWER_BIND", "127.0.0.1"),
     "sync_interval": int(os.environ.get("N8N_VIEWER_SYNC_INTERVAL", "300")),
     "page_size": int(os.environ.get("N8N_VIEWER_PAGE_SIZE", "50")),
+    "retention_days": int(os.environ.get("N8N_VIEWER_RETENTION_DAYS", "0")),
 }
 
 STATUS_FILTER = {"success", "error", "crashed", "canceled", "waiting", "running"}
@@ -87,6 +91,7 @@ def _sync_body():
         set_state("running", "1")
         STATE.step = "fetch"
         result = syncmod.run_sync(CONFIG["n8n_db"], CONFIG["history_db"], progress)
+        result["retentionDeleted"] = apply_retention()
         set_state("last_ok", "1")
         set_state("last_error", "")
         set_state("last_result", json.dumps(result))
@@ -98,6 +103,39 @@ def _sync_body():
     finally:
         set_state("running", "0")
         STATE.step = ""
+
+
+def apply_retention():
+    """S6: drop history older than N8N_VIEWER_RETENTION_DAYS (0 = keep all).
+
+    Runs while the sync lock is held. Deletes only from this viewer's own
+    history, never from n8n's database. fts_executions and executions_data
+    are cleaned explicitly (the fts5 table has no foreign keys and the
+    per-connection foreign_keys pragma is not guaranteed), so the deletions
+    are deterministic regardless of pragma state.
+    """
+    days = CONFIG.get("retention_days", 0)
+    if days <= 0:
+        return 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
+        "%Y-%m-%d %H:%M:%S.000")
+    con = history()
+    try:
+        ids = [r[0] for r in con.execute(
+            "SELECT id FROM executions WHERE started_at < ?", (cutoff,))]
+        if not ids:
+            return 0
+        con.execute("BEGIN")
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            con.execute(f"DELETE FROM fts_executions WHERE execution_id IN ({marks})", chunk)
+            con.execute(f"DELETE FROM executions_data WHERE execution_id IN ({marks})", chunk)
+            con.execute(f"DELETE FROM executions WHERE id IN ({marks})", chunk)
+        con.commit()
+        return len(ids)
+    finally:
+        con.close()
 
 
 def run_sync_now():
@@ -350,8 +388,9 @@ class Handler(BaseHTTPRequestHandler):
             deleted = con.execute(
                 "SELECT count(*) FROM executions WHERE deleted_at IS NOT NULL"
             ).fetchone()[0]
-            first, last = con.execute(
-                "SELECT min(started_at), max(started_at) FROM executions").fetchone()
+            first, last, total_json = con.execute(
+                "SELECT min(started_at), max(started_at), "
+                "COALESCE(SUM(json_size),0) FROM executions").fetchone()
             issues = con.execute(
                 "SELECT value FROM sync_state WHERE key='import_issues'").fetchone()
         finally:
@@ -364,7 +403,47 @@ class Handler(BaseHTTPRequestHandler):
             "importIssues": int(issues[0]) if issues else 0,
             "firstStartedAt": first,
             "lastStartedAt": last,
+            "retentionDays": CONFIG.get("retention_days", 0),
+            "storage": self._storage_stats(first, total_json),
         })
+
+    def _storage_stats(self, first_started, total_json):
+        """S7: current disk use of the history DB plus an honest estimate of
+        its growth (average imported payload per day since the first row).
+        """
+        db_path = CONFIG["history_db"]
+        try:
+            db_bytes = os.path.getsize(db_path)
+        except OSError:
+            db_bytes = 0
+        try:
+            du = shutil.disk_usage(os.path.dirname(os.path.abspath(db_path)))
+            total_disk, free_disk = du.total, du.free
+        except OSError:
+            total_disk, free_disk = 0, 0
+        est_bytes_per_day = 0
+        if first_started:
+            try:
+                first_dt = datetime.strptime(
+                    first_started, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=timezone.utc)
+                days = max((datetime.now(timezone.utc) - first_dt).total_seconds()
+                           / 86400.0, 1.0)
+                est_bytes_per_day = int(total_json / days)
+            except ValueError:
+                pass
+        projected_30d = db_bytes + est_bytes_per_day * 30
+        pct = (db_bytes / total_disk * 100) if total_disk else 0.0
+        pct_30d = (projected_30d / total_disk * 100) if total_disk else 0.0
+        return {
+            "dbBytes": db_bytes,
+            "freeDiskBytes": free_disk,
+            "totalDiskBytes": total_disk,
+            "percentOfDisk": round(pct, 3),
+            "estBytesPerDay": est_bytes_per_day,
+            "projectedBytes30d": projected_30d,
+            "projectedPercentOfDisk30d": round(pct_30d, 3),
+            "retentionDays": CONFIG.get("retention_days", 0),
+        }
 
     def _workflows(self):
         con = history()

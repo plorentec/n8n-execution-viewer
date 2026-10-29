@@ -17,6 +17,8 @@ services:
     environment:
       # where the SQLite file lives inside the mounted volume
       - N8N_DB_PATH=/data/database.sqlite
+      # optional: keep the history only N days (0 = forever, the default)
+      # - N8N_VIEWER_RETENTION_DAYS=180
     volumes:
       # the SAME volume your n8n service uses, read-only
       - n8n_data:/data:ro

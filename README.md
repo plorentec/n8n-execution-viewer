@@ -187,6 +187,31 @@ Open `https://your-host/n8n-viewer/`.
 | `N8N_VIEWER_PORT` | `8391` | API port |
 | `N8N_VIEWER_SYNC_INTERVAL` | `300` | seconds between automatic syncs |
 | `N8N_VIEWER_PAGE_SIZE` | `50` | executions per page |
+| `N8N_VIEWER_RETENTION_DAYS` | `0` | keep the history this many days; `0` = keep forever. After each sync, older rows are dropped from the history (never from n8n's own database). Also `--retention-days N` in `install.sh` |
+
+### Branding (logo and title)
+
+Drop an optional `brand.json` next to `index.html` (in your web root):
+
+```json
+{ "title": "Mi Empresa", "subtitle": "historial de n8n", "logo": "logo.png", "favicon": "favicon.png" }
+```
+
+- `title` replaces the heading, `subtitle` the small caption below it, and
+  the browser tab becomes `"title · subtitle"`.
+- `logo` replaces the default icon (any image file, shown at 42 px).
+- `favicon` replaces the tab icon.
+- No file, or any field missing → the current default. Nothing else needs to
+  change; it is plain static files, served by the same web server.
+
+### Disk usage
+
+`GET /api/stats` returns a `storage` block: current size of the history
+(`dbBytes`, `percentOfDisk`), free space on that disk, and an honest
+estimate of the growth (`estBytesPerDay`, from the average imported payload
+per day) with a 30-day projection (`projectedBytes30d`). The UI shows the
+current percentage in the fifth card, details in the tooltip, and the active
+retention in the card label.
 
 ## API (what the viewer consumes)
 

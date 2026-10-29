@@ -24,10 +24,10 @@
 <div class="topbar"></div>
 <header>
   <div class="brand">
-    <svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 12h8M12 8v8"/></svg>
+    <svg class="logo" id="brand-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 12h8M12 8v8"/></svg>
     <div class="brand-txt">
-      <h1>Your company</h1>
-      <span>n8n execution viewer</span>
+      <h1 id="brand-title">Your company</h1>
+      <span id="brand-sub">n8n execution viewer</span>
     </div>
   </div>
   <div class="header-right">
@@ -64,6 +64,11 @@
       <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></div>
       <div class="val" id="st-lost">—</div>
       <div class="lbl" id="st-lost-lbl">Borradas en n8n</div>
+    </div>
+    <div class="stat s5">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3"/></svg></div>
+      <div class="val" id="st-disk" title="">—</div>
+      <div class="lbl" id="st-disk-lbl">Disco (histórico)</div>
     </div>
   </section>
 

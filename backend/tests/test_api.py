@@ -5,6 +5,7 @@ fixture + a throwaway history database.
 """
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -50,6 +51,7 @@ class ApiTestBase(unittest.TestCase):
             "n8n_db": cls.n8n_db,
             "history_db": cls.hist_db,
             "page_size": 50,
+            "retention_days": 0,  # reset per class: retention tests mutate it
         })
         schema.init_history(cls.hist_db)
         syncmod.run_sync(cls.n8n_db, cls.hist_db)
@@ -292,6 +294,112 @@ class TestSyncEndpoint(ApiTestBase):
             if not s["running"]:
                 break
             time.sleep(0.05)
+
+
+class TestStatsStorage(ApiTestBase):
+    """S7: /api/stats exposes the storage block (current + estimated disk use)."""
+
+    def test_stats_storage_block(self):
+        code, body = self.get("/api/stats")
+        self.assertEqual(code, 200)
+        st = body["storage"]
+        self.assertGreater(st["dbBytes"], 0)
+        self.assertGreaterEqual(st["percentOfDisk"], 0.0)
+        self.assertLessEqual(st["percentOfDisk"], 100.0)
+        self.assertGreater(st["estBytesPerDay"], 0)
+        self.assertGreaterEqual(st["projectedBytes30d"], st["dbBytes"])
+        self.assertGreaterEqual(st["projectedPercentOfDisk30d"], st["percentOfDisk"])
+        self.assertEqual(st["retentionDays"], 0)
+        self.assertIn("freeDiskBytes", st)
+        self.assertIn("totalDiskBytes", st)
+
+
+class RetentionBase(ApiTestBase):
+    """Base for S6 tests: make the history's old/new split calendar-proof
+    by rewriting started_at relative to now (both DBs store UTC
+    'YYYY-MM-DD HH:MM:SS.mmm')."""
+
+    @classmethod
+    def shift_history_dates(cls, old_ids, new_ids):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        fmt = "%Y-%m-%d %H:%M:%S.000"
+        con = sqlite3.connect(cls.hist_db)
+        for eid in old_ids:
+            con.execute("UPDATE executions SET started_at=? WHERE id=?",
+                        ((now - timedelta(days=10)).strftime(fmt), eid))
+        for eid in new_ids:
+            con.execute("UPDATE executions SET started_at=? WHERE id=?",
+                        ((now - timedelta(hours=1)).strftime(fmt), eid))
+        con.commit()
+        con.close()
+
+
+class TestRetentionOn(RetentionBase):
+    """S6: retention_days=2 deletes old history rows (exec + data + fts)."""
+
+    OLD = (101, 102, 103, 104, 105, 106, 107, 108)
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.shift_history_dates(cls.OLD, (110,))
+        app.CONFIG["retention_days"] = 2
+
+    def test_old_rows_deleted_everywhere(self):
+        self.assertTrue(app.run_sync_now())
+        con = sqlite3.connect(self.hist_db)
+        try:
+            gone = con.execute(
+                "SELECT count(*) FROM executions WHERE id IN (101,102,103,104,105,106,107,108)"
+            ).fetchone()[0]
+            self.assertEqual(gone, 0)
+            data_left = con.execute(
+                "SELECT count(*) FROM executions_data WHERE execution_id IN (101,102,103,104,105,106,107,108)"
+            ).fetchone()[0]
+            self.assertEqual(data_left, 0)
+            fts_left = con.execute(
+                "SELECT count(*) FROM fts_executions WHERE execution_id IN (101,102,103,104,105,106,107,108)"
+            ).fetchone()[0]
+            self.assertEqual(fts_left, 0)
+            kept = con.execute("SELECT count(*) FROM executions WHERE id=110").fetchone()[0]
+            self.assertEqual(kept, 1)
+        finally:
+            con.close()
+
+    def test_api_reflects_retention(self):
+        self.assertTrue(app.run_sync_now())
+        _, s = self.get("/api/stats")
+        self.assertEqual(s["executions"], 1)
+        self.assertEqual(s["retentionDays"], 2)
+        self.assertEqual(s["storage"]["retentionDays"], 2)
+        _, res = self.get("/api/sync")
+        self.assertEqual(res["last"]["result"].get("retentionDeleted"), 8)
+
+    def test_fts_search_no_longer_finds_deleted_text(self):
+        self.assertTrue(app.run_sync_now())
+        # "ACME" lived in execution 107, which is older than the cutoff
+        _, body = self.get("/api/executions?q=ACME")
+        self.assertEqual(body["items"], [])
+
+
+class TestRetentionOff(RetentionBase):
+    """S6: retention_days=0 (default) never deletes, even very old rows."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.shift_history_dates((101, 102), (110,))
+        # retention_days stays 0 (set by ApiTestBase)
+
+    def test_nothing_deleted(self):
+        self.assertTrue(app.run_sync_now())
+        _, res = self.get("/api/sync")
+        self.assertEqual(res["last"]["result"].get("retentionDeleted"), 0)
+        con = sqlite3.connect(self.hist_db)
+        kept = con.execute("SELECT count(*) FROM executions WHERE id IN (101,102)").fetchone()[0]
+        con.close()
+        self.assertEqual(kept, 2)
 
 
 if __name__ == "__main__":

@@ -296,11 +296,37 @@ async function loadStats() {
     $("st-lost-lbl").textContent = s.importIssues
       ? `Borradas en n8n · ${nf.format(s.importIssues)} filas irrecuperables`
       : "Borradas en n8n";
+    renderDisk(s.storage);
     lastStats = s;
     renderLive(s, null);
   } catch (e) {
     $("live-txt").textContent = `Error: ${e.message}`;
   }
+}
+
+function fmtBytes(n) {
+  if (n == null) return "—";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n >= 100 ? Math.round(n) : n.toFixed(1)} ${u[i]}`;
+}
+
+// S7: current disk use of the history, with the estimate in the tooltip.
+function renderDisk(st) {
+  const val = $("st-disk");
+  if (!st || !val) return;
+  val.textContent = `${st.percentOfDisk}%`;
+  val.title = [
+    `Histórico: ${fmtBytes(st.dbBytes)}`,
+    `Crecimiento estimado: ~${fmtBytes(st.estBytesPerDay)}/día`,
+    `Proyección a 30 días: ~${fmtBytes(st.projectedBytes30d)} (${st.projectedPercentOfDisk30d}%)`,
+    st.retentionDays > 0 ? `Retención: ${st.retentionDays} días` : "Retención: ilimitada",
+    st.totalDiskBytes ? `Disco: ${fmtBytes(st.freeDiskBytes)} libres` : "",
+  ].filter(Boolean).join(" · ");
+  $("st-disk-lbl").textContent = st.retentionDays > 0
+    ? `Disco (ret. ${st.retentionDays} d)`
+    : "Disco (histórico)";
 }
 
 function renderWorkflows() {
@@ -853,10 +879,44 @@ async function applyHash() {
   if (h.node && (h.node !== state.node || h.run !== state.run)) return selectNode(h.node, h.run);
 }
 
+// S8: optional brand.json next to index.html:
+// {"title": "...", "subtitle": "...", "logo": "logo.png", "favicon": "favicon.png"}
+// Missing file or missing field = the current default. No backend involved.
+async function applyBrand() {
+  let brand = null;
+  try {
+    const r = await fetch("brand.json", { cache: "no-cache" });
+    if (r.ok) brand = await r.json();
+  } catch { /* no brand file: keep defaults */ }
+  if (!brand) return;
+  const title = $("brand-title"), sub = $("brand-sub");
+  if (brand.title && title) title.textContent = brand.title;
+  if (brand.subtitle && sub) sub.textContent = brand.subtitle;
+  if (brand.logo) {
+    const svg = document.getElementById("brand-logo");
+    if (svg) {
+      const img = document.createElement("img");
+      img.className = "logo";
+      img.src = brand.logo;
+      img.alt = "";
+      svg.replaceWith(img);
+    }
+  }
+  if (brand.favicon) {
+    let link = document.querySelector('link[rel="icon"]');
+    if (!link) { link = document.createElement("link"); link.rel = "icon"; document.head.appendChild(link); }
+    link.href = brand.favicon;
+  }
+  if (brand.title || brand.subtitle) {
+    document.title = [brand.title, brand.subtitle].filter(Boolean).join(" · ");
+  }
+}
+
 window.addEventListener("popstate", applyHash);
 
 (async () => {
   await Promise.all([loadStats(), loadWorkflows()]);
+  await applyBrand();
   await applyHash();
   // Show the last sync, and follow one that is already running (e.g. the scheduled one).
   watchSync({ refresh: false });

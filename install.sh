@@ -27,6 +27,7 @@ WEB_ROOT="/var/www/n8n-viewer"
 BIND="127.0.0.1"
 PORT=8391
 SYNC_INTERVAL=300
+RETENTION_DAYS=0
 UNIT_NAME="n8n-viewer"
 APACHE_CONF=""
 VHOST_PORT=""
@@ -49,6 +50,7 @@ Options:
   --bind ADDR          API bind address (default 127.0.0.1)
   --port PORT          API port (default 8391)
   --sync-interval SEC  seconds between automatic syncs (default 300)
+  --retention-days N   keep history this many days, 0 = keep forever (default 0)
   --unit-name NAME     systemd unit name (default n8n-viewer)
   --apache-conf FILE   Apache vhost conf to patch with a managed block
   --vhost-port PORT    which <VirtualHost> in that file to patch (default: the first)
@@ -72,6 +74,7 @@ while [ $# -gt 0 ]; do
     --bind) BIND="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --sync-interval) SYNC_INTERVAL="$2"; shift 2 ;;
+    --retention-days) RETENTION_DAYS="$2"; shift 2 ;;
     --unit-name) UNIT_NAME="$2"; shift 2 ;;
     --apache-conf) APACHE_CONF="$2"; shift 2 ;;
     --vhost-port) VHOST_PORT="$2"; shift 2 ;;
@@ -182,7 +185,7 @@ log "plan:"
 log "  frontend  -> $WEB_ROOT"
 log "  backend   -> $BACKEND_DIR"
 log "  history   -> $HISTORY_DB (preserved on re-runs)"
-log "  service   -> ${UNIT_NAME}.service (bind $BIND:$PORT, sync every ${SYNC_INTERVAL}s)"
+log "  service   -> ${UNIT_NAME}.service (bind $BIND:$PORT, sync every ${SYNC_INTERVAL}s, retention ${RETENTION_DAYS}d)"
 [ -n "$APACHE_CONF" ] && log "  apache    -> managed block in $APACHE_CONF"
 
 if [ "$DRY" -eq 1 ]; then
@@ -220,6 +223,7 @@ Environment=N8N_VIEWER_DB=$HISTORY_DB
 Environment=N8N_VIEWER_BIND=$BIND
 Environment=N8N_VIEWER_PORT=$PORT
 Environment=N8N_VIEWER_SYNC_INTERVAL=$SYNC_INTERVAL
+Environment=N8N_VIEWER_RETENTION_DAYS=$RETENTION_DAYS
 StandardOutput=journal
 StandardError=journal
 

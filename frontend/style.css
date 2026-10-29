@@ -112,7 +112,7 @@ body.theme-dark .theme-toggle .ic-sun { display: block; }
 main { max-width: 1760px; margin: 0 auto; padding: 24px 28px 20px; }
 
 /* ---- Stats ---- */
-.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; margin-bottom: 18px; }
+.stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 18px; margin-bottom: 18px; }
 .stat {
   background: var(--card); border: 1px solid var(--border); border-radius: 16px;
   padding: 18px 20px; position: relative; overflow: hidden;
