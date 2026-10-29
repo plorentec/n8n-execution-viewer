@@ -70,9 +70,10 @@ function fmtMs(ms) {
 
 function fmtBytes(n) {
   if (n == null) return "—";
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n >= 100 ? Math.round(n) : n.toFixed(1)} ${u[i]}`;
 }
 
 const shortType = (t) => (t ? t.split(".").pop() : "");
@@ -302,14 +303,6 @@ async function loadStats() {
   } catch (e) {
     $("live-txt").textContent = `Error: ${e.message}`;
   }
-}
-
-function fmtBytes(n) {
-  if (n == null) return "—";
-  const u = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0;
-  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-  return `${n >= 100 ? Math.round(n) : n.toFixed(1)} ${u[i]}`;
 }
 
 // S7: current disk use of the history, with the estimate in the tooltip.
