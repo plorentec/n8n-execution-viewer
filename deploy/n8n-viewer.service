@@ -1,0 +1,20 @@
+[Unit]
+Description=n8n execution viewer backend (persistent history + API)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+WorkingDirectory=/opt/n8n-viewer
+ExecStart=/usr/bin/python3 /opt/n8n-viewer/app.py
+Restart=always
+RestartSec=5
+Environment=N8N_DB_PATH=/var/lib/docker/volumes/n8n_n8n_n8n_data/_data/database.sqlite
+Environment=N8N_VIEWER_DB=/var/lib/n8n-viewer/history.db
+Environment=N8N_VIEWER_BIND=127.0.0.1
+Environment=N8N_VIEWER_PORT=8391
+Environment=N8N_VIEWER_SYNC_INTERVAL=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
