@@ -430,6 +430,12 @@ footer b { color: var(--primary); }
 }
 
 /* ---------- Settings modal (S9) ---------- */
+
+/* Author display rules must not resurrect elements hidden via the `hidden`
+   attribute: the UA stylesheet's display:none loses to ANY explicit display
+   rule (this is why the overlay stayed visible and un-closeable). */
+[hidden] { display: none !important; }
+
 .overlay {
   position: fixed; inset: 0; z-index: 60;
   background: rgba(15, 18, 24, .45);
