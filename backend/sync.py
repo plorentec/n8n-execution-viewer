@@ -5,17 +5,25 @@ issues ordinary SELECTs against the live database. n8n runs its SQLite in WAL
 mode, so read-only connections never block the running instance.
 """
 import json
+import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
 
 import schema
 
+LOG = logging.getLogger("n8n-viewer.sync")
+
 # Rows re-read on every sync so late transitions (running -> finished,
 # soft-deletes) are picked up even after their first import.
 RESCAN_WINDOW = 500
 # Per-node cap for the FTS index text (keeps the index lean on huge payloads).
 NODE_TEXT_LIMIT = 200_000
+# S8: per-execution payload cap (N8N_VIEWER_MAX_BLOB_MB in app.CONFIG). A
+# blob above it is neither loaded nor re-serialized nor indexed: the execution
+# is stored as data_missing with a parse_error reason instead, so one giant
+# execution cannot bloat the history or stall the sync.
+DEFAULT_MAX_BLOB_BYTES = 50 * 1024 * 1024
 
 # Measured against n8n 2.29.10 (database.sqlite in the Docker volume).
 # n8n keeps evolving this schema, so the set is checked on every sync and a
@@ -174,18 +182,30 @@ def _set_state(con, key, value):
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
 
 
-def run_sync(n8n_path, history_path, progress=None):
+def run_sync(n8n_path, history_path, progress=None, retention_cutoff=None,
+             max_blob_bytes=None):
     """Import the delta of n8n executions into the history.
 
-    Returns {"added": n, "updated": n, "skipped": n}. Raises SyncError (or
-    sqlite3 errors) on failure; the history transaction is rolled back so a
-    failed sync never leaves partial data behind.
+    Returns {"added": n, "updated": n, "skipped": n}, plus two counters that
+    are only present when non-zero so an ordinary pass keeps the previous
+    shape (and /api/sync last.result stays compatible):
+      * retentionSkipped  rows older than `retention_cutoff`, a subset of
+                          `skipped`: they were not imported at all because
+                          retention would delete them at the end of this same
+                          sync
+      * oversizedBlobs    rows whose payload is over `max_blob_bytes`, so it
+                          was never loaded, serialized or indexed
+    Raises SyncError (or sqlite3 errors) on failure; the history transaction
+    is rolled back so a failed sync never leaves partial data behind.
     """
+    if max_blob_bytes is None:
+        max_blob_bytes = DEFAULT_MAX_BLOB_BYTES
     n8n = open_n8n(n8n_path)
     schema.init_history(history_path)  # idempotent; allows standalone first run
     hist = sqlite3.connect(history_path, timeout=15)
     hist.execute("PRAGMA busy_timeout=15000")
     added = updated = skipped = 0
+    retention_skipped = oversized = 0
     try:
         check_schema(n8n)
         state = _state(hist)
@@ -222,10 +242,24 @@ def run_sync(n8n_path, history_path, progress=None):
         new_ids = []
         max_id = last_id
         for (eid, wf, status, mode, started, stopped, deleted, jsize) in rows:
+            # Gap accounting must see every id n8n still has, imported or not
             all_ids.append(eid)
             max_id = max(max_id, eid)
             if eid > last_id:
                 new_ids.append(eid)
+            if retention_cutoff is not None and started and started < retention_cutoff:
+                # S7: retention deletes anything older than the cutoff at the
+                # end of this very sync, so downloading, serializing and
+                # indexing it would only be undone a moment later (and again
+                # on every pass, because the rescan window keeps re-reading
+                # these ids). Reported on its own as `retentionSkipped` and
+                # also counted in `skipped` (that is what it is: a row seen
+                # and not imported), so the sync result the viewer already
+                # reads keeps its meaning. It never touches the gap math:
+                # these ids do exist in n8n.
+                retention_skipped += 1
+                skipped += 1
+                continue
             old = hist.execute(
                 "SELECT status, stopped_at, deleted_at FROM executions WHERE id=?",
                 (eid,)).fetchone()
@@ -239,35 +273,60 @@ def run_sync(n8n_path, history_path, progress=None):
                 skipped += 1
 
             data_text = None
+            texts = {}
             parse_error = None
             data_missing = 0
             parsed = None
-            row = n8n.execute(
-                "SELECT data, workflowData FROM execution_data "
-                "WHERE executionId=?", (eid,)).fetchone()
-            data_raw = wf_raw = None
-            if row is not None:
-                data_raw, wf_raw = row
-            if data_raw is None:
-                data_missing = 1  # pruned by n8n or never written
+            if jsize is not None and jsize > max_blob_bytes:
+                # S8: the blob is skipped before it is read: n8n's own count
+                # is enough to know it does not fit, so nothing is loaded,
+                # re-serialized or indexed for it.
+                oversized += 1
+                data_missing = 1
+                parse_error = (
+                    f"execution data too large: n8n reports {jsize} bytes, "
+                    f"over the {max_blob_bytes} byte cap "
+                    f"(N8N_VIEWER_MAX_BLOB_MB)")[:200]
             else:
-                try:
-                    parsed = decode_execution_data(data_raw)
-                except (ValueError, TypeError, RecursionError) as e:
-                    parse_error = f"cannot decode execution data: {e}"[:200]
-                    data_missing = 1
-            # n8n >= 2.x keeps the workflow snapshot in its own column;
-            # merge it into the stored blob so the detail view and the
-            # diagram work even for rows whose run data was pruned.
-            if wf_raw:
-                try:
-                    if parsed is None:
-                        parsed = {}
-                    parsed["workflowData"] = json.loads(wf_raw)
-                except (ValueError, TypeError):
-                    pass  # keep whatever the data column gave us
-            if parsed is not None:
-                data_text = json.dumps(parsed)
+                row = n8n.execute(
+                    "SELECT data, workflowData FROM execution_data "
+                    "WHERE executionId=?", (eid,)).fetchone()
+                data_raw = wf_raw = None
+                if row is not None:
+                    data_raw, wf_raw = row
+                if data_raw is None:
+                    data_missing = 1  # pruned by n8n or never written
+                else:
+                    try:
+                        parsed = decode_execution_data(data_raw)
+                    except (ValueError, TypeError, RecursionError) as e:
+                        parse_error = f"cannot decode execution data: {e}"[:200]
+                        data_missing = 1
+                # n8n >= 2.x keeps the workflow snapshot in its own column;
+                # merge it into the stored blob so the detail view and the
+                # diagram work even for rows whose run data was pruned.
+                if wf_raw:
+                    try:
+                        if parsed is None:
+                            parsed = {}
+                        parsed["workflowData"] = json.loads(wf_raw)
+                    except (ValueError, TypeError):
+                        pass  # keep whatever the data column gave us
+            # Serializing and indexing are part of the same step: flatted
+            # revives shared references, so a cyclic payload reaches this
+            # point as a real cycle and json.dumps (or the string walk)
+            # rejects it. Such an execution is stored as parse_error with its
+            # data marked missing instead of aborting the whole sync, and
+            # nothing is serialized again for a blob being discarded.
+            try:
+                if parsed is not None:
+                    data_text = json.dumps(parsed)
+                    texts = node_texts(parsed)
+            except (ValueError, TypeError, RecursionError) as e:
+                parse_error = f"cannot encode execution data: {e}"[:200]
+                data_missing = 1
+                data_text = None
+                texts = {}
             last_node = None
             if isinstance(parsed, dict):
                 candidate = (parsed.get("resultData") or {}).get("lastNodeExecuted")
@@ -296,12 +355,11 @@ def run_sync(n8n_path, history_path, progress=None):
                     (eid, data_text))
             hist.execute(
                 "DELETE FROM fts_executions WHERE execution_id=?", (str(eid),))
-            if parsed is not None:
-                for node, text in node_texts(parsed).items():
-                    hist.execute(
-                        "INSERT INTO fts_executions(execution_id, workflow_id, "
-                        "node_name, text) VALUES(?,?,?,?)",
-                        (str(eid), wf, node, text))
+            for node, text in texts.items():
+                hist.execute(
+                    "INSERT INTO fts_executions(execution_id, workflow_id, "
+                    "node_name, text) VALUES(?,?,?,?)",
+                    (str(eid), wf, node, text))
 
         # ---- import: gaps (ids n8n hard-deleted while we were running)
         missing = 0
@@ -329,4 +387,18 @@ def run_sync(n8n_path, history_path, progress=None):
     finally:
         n8n.close()
         hist.close()
-    return {"added": added, "updated": updated, "skipped": skipped}
+    if retention_skipped:
+        LOG.debug("sync: %d execution(s) older than the retention cutoff were "
+                  "not imported", retention_skipped)
+    if oversized:
+        # one line per sync, with the count: a single oversized execution
+        # must not turn into one log line per row
+        LOG.warning("sync: %d execution(s) stored without their payload: n8n "
+                    "reports more than the %d byte cap "
+                    "(N8N_VIEWER_MAX_BLOB_MB)", oversized, max_blob_bytes)
+    result = {"added": added, "updated": updated, "skipped": skipped}
+    if retention_skipped:
+        result["retentionSkipped"] = retention_skipped
+    if oversized:
+        result["oversizedBlobs"] = oversized
+    return result

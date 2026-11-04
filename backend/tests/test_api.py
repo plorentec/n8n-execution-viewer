@@ -3,6 +3,7 @@
 Boots the real HTTP server on an ephemeral port against a synthetic n8n
 fixture + a throwaway history database.
 """
+from http.client import HTTPConnection
 import json
 import os
 import sqlite3
@@ -246,6 +247,13 @@ class TestNodeDetail(ApiTestBase):
         code, _ = self.get("/api/executions/107/nodes/Trigger?run=5")
         self.assertEqual(code, 404)
 
+    def test_negative_run_index_404(self):
+        # S5: runs[-1] would silently return the last run instead of a 404
+        for run in (-1, -5):
+            code, body = self.get(f"/api/executions/107/nodes/Trigger?run={run}")
+            self.assertEqual(code, 404, f"run={run} must not resolve")
+            self.assertIn("error", body)
+
 
 class TestSyncEndpoint(ApiTestBase):
     def test_status_shape(self):
@@ -295,6 +303,125 @@ class TestSyncEndpoint(ApiTestBase):
             if not s["running"]:
                 break
             time.sleep(0.05)
+
+
+class TestHttpFraming(ApiTestBase):
+    """S2/S3: HTTP/1.1 keep-alive framing of POST bodies.
+
+    protocol_version is HTTP/1.1, so a response sent before the request body
+    is read leaves those bytes in the stream and the next request on that
+    connection is parsed from the body (the client sees a 400/501).
+    """
+
+    def conn(self):
+        parsed = urllib.parse.urlparse(self.base)
+        c = HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+        self.addCleanup(c.close)
+        return c
+
+    def post(self, conn, path, body, headers=None):
+        hdrs = {"Content-Length": str(len(body))}
+        hdrs.update(headers or {})
+        conn.request("POST", path, body=body, headers=hdrs)
+        res = conn.getresponse()
+        payload = json.loads(res.read().decode())
+        return res.status, payload
+
+    def get_on(self, conn, path):
+        conn.request("GET", path)
+        res = conn.getresponse()
+        return res.status, json.loads(res.read().decode())
+
+    def test_403_drains_body(self):
+        conn = self.conn()
+        code, body = self.post(conn, "/api/config", b'{"retentionDays": 5}', {})
+        self.assertEqual(code, 403)
+        self.assertIn("error", body)
+        code, body = self.get_on(conn, "/api/config")
+        self.assertEqual(code, 200, "the next request on that connection broke")
+
+    def test_404_post_drains_body(self):
+        conn = self.conn()
+        code, _ = self.post(conn, "/api/nope", b'{"x": 1}', {})
+        self.assertEqual(code, 404)
+        code, body = self.get_on(conn, "/api/stats")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["executions"], 9)
+
+    def test_409_drains_body(self):
+        def slow(*a, **k):
+            time.sleep(0.6)
+            return {"added": 0, "updated": 0, "skipped": 0}
+        original = app.syncmod.run_sync
+        app.syncmod.run_sync = slow
+        try:
+            conn = self.conn()
+            code, _ = self.post(conn, "/api/sync", b'{"start": 1}',
+                                {"x-viewer-action": "sync"})
+            self.assertEqual(code, 200)
+            code, body = self.post(conn, "/api/sync", b'{"again": 1}',
+                                   {"x-viewer-action": "sync"})
+            self.assertEqual(code, 409)
+            self.assertIn("error", body)
+            code, body = self.get_on(conn, "/api/sync")
+            self.assertEqual(code, 200, "the next request on that connection broke")
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                _, s = self.get("/api/sync")
+                if not s["running"]:
+                    break
+                time.sleep(0.05)
+        finally:
+            app.syncmod.run_sync = original
+
+    def test_413_drains_body(self):
+        limit = app.MAX_CONFIG_BYTES
+        app.MAX_CONFIG_BYTES = 64
+        try:
+            conn = self.conn()
+            code, body = self.post(conn, "/api/config", b"x" * 200,
+                                   {"x-viewer-action": "config"})
+            self.assertEqual(code, 413)
+            self.assertIn("error", body)
+            code, body = self.get_on(conn, "/api/config")
+            self.assertEqual(code, 200, "the next request on that connection broke")
+        finally:
+            app.MAX_CONFIG_BYTES = limit
+
+    def raw_post(self, conn, path, headers):
+        conn.putrequest("POST", path)
+        for name, value in headers.items():
+            conn.putheader(name, value)
+        conn.endheaders()
+        res = conn.getresponse()
+        payload = json.loads(res.read().decode())
+        return res, payload
+
+    def test_negative_content_length_rejected(self):
+        # S3: rfile.read(-1) blocks until EOF instead of answering.
+        conn = self.conn()
+        res, body = self.raw_post(conn, "/api/config", {
+            "x-viewer-action": "config", "Content-Length": "-5"})
+        self.assertEqual(res.status, 400)
+        self.assertIn("Content-Length", body["error"])
+        self.assertEqual(res.getheader("Connection"), "close")
+
+    def test_non_numeric_content_length_rejected(self):
+        conn = self.conn()
+        res, body = self.raw_post(conn, "/api/config", {
+            "x-viewer-action": "config", "Content-Length": "abc"})
+        self.assertEqual(res.status, 400)
+        self.assertIn("Content-Length", body["error"])
+        self.assertEqual(res.getheader("Connection"), "close")
+
+    def test_zero_content_length_is_empty_body(self):
+        conn = self.conn()
+        code, body = self.post(conn, "/api/config", b"",
+                               {"x-viewer-action": "config"})
+        self.assertEqual(code, 400)
+        self.assertIn("expected a JSON object", body["error"])
+        code, _ = self.get_on(conn, "/api/config")
+        self.assertEqual(code, 200)
 
 
 class TestStatsStorage(ApiTestBase):
@@ -421,6 +548,35 @@ class TestRetentionOn(RetentionBase):
         finally:
             con.close()
 
+    def test_fts_rows_really_deleted(self):
+        # S4: fts_executions.execution_id holds TEXT (FTS5 columns have no
+        # type affinity), so the retention DELETE must bind str() or it
+        # silently matches nothing. Compare the same way the data is stored.
+        marks = ",".join("?" * len(self.OLD))
+        params = tuple(str(i) for i in self.OLD)
+        syncmod.run_sync(self.n8n_db, self.hist_db)  # rebuild the FTS index
+        con = sqlite3.connect(self.hist_db)
+        try:
+            before = con.execute(
+                f"SELECT count(*) FROM fts_executions WHERE execution_id IN ({marks})",
+                params).fetchone()[0]
+        finally:
+            con.close()
+        self.assertGreater(before, 0)
+        self.assertEqual(app.apply_retention(), 8)
+        con = sqlite3.connect(self.hist_db)
+        try:
+            after = con.execute(
+                f"SELECT count(*) FROM fts_executions WHERE execution_id IN ({marks})",
+                params).fetchone()[0]
+            kept = con.execute(
+                "SELECT count(*) FROM fts_executions WHERE execution_id = ?",
+                ("110",)).fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(after, 0, "retention left stale full-text rows behind")
+        self.assertGreater(kept, 0, "retention wiped an execution it should keep")
+
     def test_api_reflects_retention(self):
         self.assertTrue(app.run_sync_now())
         _, s = self.get("/api/stats")
@@ -435,6 +591,177 @@ class TestRetentionOn(RetentionBase):
         # "ACME" lived in execution 107, which is older than the cutoff
         _, body = self.get("/api/executions?q=ACME")
         self.assertEqual(body["items"], [])
+
+
+class RetentionSpaceBase(unittest.TestCase):
+    """S6: retention must give back the space it frees.
+
+    These tests build their own history database (a few MB: hundreds of rows
+    with a 100 KB blob each and two full-text rows) so page counts and file
+    size are measurable, and they call app.apply_retention() directly: that is
+    the maintenance entry point the sync thread uses (never a request
+    handler).
+    """
+
+    OLD = 120
+    NEW = 4
+    BLOB = "z" * 100_000
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.hist_db = os.path.join(self.tmp.name, "history.sqlite")
+        saved = dict(app.CONFIG)
+
+        def restore():
+            app.CONFIG.clear()
+            app.CONFIG.update(saved)
+
+        self.addCleanup(restore)
+        app.CONFIG.update({"history_db": self.hist_db, "retention_days": 2})
+
+    def make_history(self, auto_vacuum="INCREMENTAL"):
+        ddl = schema.SCHEMA.replace("PRAGMA auto_vacuum=INCREMENTAL;",
+                                    f"PRAGMA auto_vacuum={auto_vacuum};")
+        con = sqlite3.connect(self.hist_db)
+        try:
+            con.executescript(ddl)
+            con.commit()
+        finally:
+            con.close()
+
+    def seed(self, old=OLD, new=NEW, with_blob=True):
+        """`old` rows well past a 2-day retention window, `new` rows from the
+        last hour (kept), all of them searchable."""
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        fmt = "%Y-%m-%d %H:%M:%S.000"
+        old_ts = (now - timedelta(days=30)).strftime(fmt)
+        new_ts = (now - timedelta(hours=1)).strftime(fmt)
+        con = sqlite3.connect(self.hist_db)
+        try:
+            con.execute("INSERT INTO workflows(id, name, active, updated_at) "
+                        "VALUES('wf','WF',1,'2026-01-01 00:00:00.000')")
+            for i in range(old + new):
+                eid = 1000 + i
+                started = old_ts if i < old else new_ts
+                con.execute(
+                    "INSERT INTO executions(id, workflow_id, status, started_at, "
+                    "json_size, data_missing, imported_at) VALUES(?,?,?,?,?,0,?)",
+                    (eid, "wf", "success", started, len(self.BLOB), new_ts))
+                if with_blob:
+                    con.execute(
+                        "INSERT INTO executions_data(execution_id, data) "
+                        "VALUES(?,?)", (eid, self.BLOB))
+                for n in range(2):
+                    con.execute(
+                        "INSERT INTO fts_executions(execution_id, workflow_id, "
+                        "node_name, text) VALUES(?,?,?,?)",
+                        (str(eid), "wf", f"node{n}",
+                         f"palabrasecreta{eid} relleno " * 400))
+            con.commit()
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            con.close()
+
+    def metrics(self):
+        con = sqlite3.connect(self.hist_db)
+        try:
+            return {
+                "executions": con.execute(
+                    "SELECT count(*) FROM executions").fetchone()[0],
+                "page_count": con.execute("PRAGMA page_count").fetchone()[0],
+                "freelist": con.execute("PRAGMA freelist_count").fetchone()[0],
+                "fts_bytes": con.execute(
+                    "SELECT COALESCE(SUM(length(block)),0) "
+                    "FROM fts_executions_data").fetchone()[0],
+                "size": os.path.getsize(self.hist_db),
+            }
+        finally:
+            con.close()
+
+    def fts_hits(self, phrase):
+        con = sqlite3.connect(self.hist_db)
+        try:
+            return con.execute(
+                "SELECT count(*) FROM fts_executions WHERE fts_executions MATCH ?",
+                (f'"{phrase}"',)).fetchone()[0]
+        finally:
+            con.close()
+
+
+class TestRetentionReclaimsSpace(RetentionSpaceBase):
+    def test_deleting_pass_returns_space_to_the_os(self):
+        self.make_history()
+        self.seed()
+        before = self.metrics()
+        self.assertGreaterEqual(self.fts_hits("palabrasecreta1000"), 1)
+
+        deleted = app.apply_retention()
+
+        self.assertEqual(deleted, self.OLD)
+        after = self.metrics()
+        # the rows are gone (S4 already covers the deletion itself)
+        self.assertEqual(after["executions"], self.NEW)
+        # S6: the deleted text no longer lives in the FTS index
+        self.assertEqual(self.fts_hits("palabrasecreta1000"), 0)
+        self.assertGreaterEqual(self.fts_hits("palabrasecreta1123"), 1)  # kept
+        self.assertLess(after["fts_bytes"], before["fts_bytes"] // 2,
+                        "the FTS index kept the bytes of the deleted rows")
+        # S6: the pages the delete freed went back to the OS
+        self.assertEqual(after["freelist"], 0,
+                         "retention left free pages trapped inside the file")
+        self.assertLess(after["page_count"], before["page_count"],
+                        "the history database did not get smaller")
+        self.assertLess(after["size"], before["size"] * 0.8,
+                        "the history file on disk did not shrink")
+
+    def test_noop_pass_does_not_touch_the_file(self):
+        self.make_history()
+        self.seed(old=0, new=40)
+        # free pages from something other than retention: they must survive a
+        # pass that deletes nothing
+        con = sqlite3.connect(self.hist_db)
+        con.execute("DELETE FROM executions_data WHERE execution_id < 1030")
+        con.execute("DELETE FROM executions WHERE id < 1030")
+        con.commit()
+        con.close()
+        before = self.metrics()
+        self.assertGreater(before["freelist"], 0)
+
+        self.assertEqual(app.apply_retention(), 0)
+
+        after = self.metrics()
+        self.assertEqual(after["freelist"], before["freelist"],
+                         "a no-op retention pass ran a compaction")
+        self.assertEqual(after["page_count"], before["page_count"])
+        self.assertEqual(after["fts_bytes"], before["fts_bytes"])
+
+    def test_legacy_database_is_converted_and_compacted(self):
+        # a history created by an older version has auto_vacuum=NONE: its free
+        # pages can never go back to the OS without rewriting the file once
+        self.make_history("NONE")
+        self.seed()
+        con = sqlite3.connect(self.hist_db)
+        self.assertEqual(con.execute("PRAGMA auto_vacuum").fetchone()[0], 0)
+        con.close()
+        before = self.metrics()
+        saved = app.LEGACY_VACUUM_MIN_BYTES
+        app.LEGACY_VACUUM_MIN_BYTES = 0   # the test history is a few MB
+        try:
+            self.assertEqual(app.apply_retention(), self.OLD)
+        finally:
+            app.LEGACY_VACUUM_MIN_BYTES = saved
+        after = self.metrics()
+        con = sqlite3.connect(self.hist_db)
+        try:
+            self.assertEqual(con.execute("PRAGMA auto_vacuum").fetchone()[0], 2,
+                             "the legacy history was not switched to incremental")
+        finally:
+            con.close()
+        self.assertEqual(after["freelist"], 0)
+        self.assertLess(after["page_count"], before["page_count"])
+        self.assertLess(after["size"], before["size"] * 0.8)
 
 
 class TestRetentionOff(RetentionBase):
@@ -454,6 +781,34 @@ class TestRetentionOff(RetentionBase):
         kept = con.execute("SELECT count(*) FROM executions WHERE id IN (101,102)").fetchone()[0]
         con.close()
         self.assertEqual(kept, 2)
+
+
+class TestOversizedBlobExposure(ApiTestBase):
+    """S8: the blob cap is reported through /api/sync and hides the data."""
+
+    def test_sync_reports_oversized_blobs(self):
+        fixture.add_execution(self.n8n_db, 120, "wfA", "success",
+                              "2026-10-29 12:00:00.000",
+                              "2026-10-29 12:00:01.000", 600_000_000)
+        saved = app.CONFIG["max_blob_mb"]
+        app.CONFIG["max_blob_mb"] = 1  # 1 MB: execution 120 is 600 MB by n8n
+        try:
+            self.assertTrue(app.run_sync_now())
+        finally:
+            app.CONFIG["max_blob_mb"] = saved
+        _, s = self.get("/api/sync")
+        self.assertTrue(s["last"]["ok"])
+        self.assertEqual(s["last"]["result"]["oversizedBlobs"], 1)
+        code, body = self.get("/api/executions/120")
+        self.assertEqual(code, 200)
+        self.assertTrue(body["dataMissing"])
+        self.assertIn("too large", body["parseError"])
+        self.assertEqual(body["nodes"], [])
+
+    def test_default_cap_documented(self):
+        self.assertEqual(
+            app.CONFIG["max_blob_mb"],
+            int(os.environ.get("N8N_VIEWER_MAX_BLOB_MB", "50")))
 
 
 if __name__ == "__main__":

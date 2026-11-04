@@ -1,7 +1,14 @@
 """DDL for the viewer's own history database (n8n's database is never touched)."""
 import sqlite3
 
+# S6: auto_vacuum=INCREMENTAL has to be requested before the first table is
+# created, otherwise the file is laid out with auto_vacuum=NONE and its free
+# pages can never be returned to the OS without a full VACUUM rewrite (which
+# is exactly what the retention pass must avoid on a 600 MB history). On an
+# existing database this pragma is a no-op; such a file is converted once by
+# app._legacy_vacuum().
 SCHEMA = """
+PRAGMA auto_vacuum=INCREMENTAL;
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 

@@ -349,27 +349,35 @@ def create_n8n_db(path):
     con.close()
 
 
-def add_execution(path, eid, workflow, status, started, stopped=None, jsize=None):
-    """Append a new execution (used to test incremental sync)."""
+def add_execution(path, eid, workflow, status, started, stopped=None, jsize=None,
+                  blob=None, wf=None):
+    """Append a new execution (used to test incremental sync).
+
+    blob/wf override the default payload, so a test can store a shape the
+    builders above do not produce (e.g. a self-referencing structure, which
+    flatted_strify encodes faithfully and flatted_resolve revives as a cycle).
+    """
     con = sqlite3.connect(path)
     con.execute(
         "INSERT INTO execution_entity(id, workflowId, status, stoppedAt, mode, "
         "deletedAt, startedAt, jsonSizeBytes) VALUES(?,?,?,?,?,?,?,?)",
         (eid, workflow, status, stopped, "manual", None, started, jsize))
-    blob = {
-        "version": 1,
-        "startData": {"sourceNodeName": "New"},
-        "resultData": {
-            "runData": {
-                "New": [_run(started.replace(" ", "T") + "Z",
-                              items=[[{"json": {"fresh": True}}]])],
+    if blob is None:
+        blob = {
+            "version": 1,
+            "startData": {"sourceNodeName": "New"},
+            "resultData": {
+                "runData": {
+                    "New": [_run(started.replace(" ", "T") + "Z",
+                                  items=[[{"json": {"fresh": True}}]])],
+                },
+                "lastNodeExecuted": "New",
             },
-            "lastNodeExecuted": "New",
-        },
-    }
-    wf = {"nodes": [{"name": "New", "type": "n8n-nodes-base.manualTrigger",
-                     "position": [0, 0], "parameters": {}}],
-          "connections": {"New": {"main": []}}}
+        }
+    if wf is None:
+        wf = {"nodes": [{"name": "New", "type": "n8n-nodes-base.manualTrigger",
+                         "position": [0, 0], "parameters": {}}],
+              "connections": {"New": {"main": []}}}
     con.execute("INSERT INTO execution_data(executionId, data, workflowData) "
                 "VALUES(?,?,?)",
                 (eid, json.dumps(flatted_strify(blob), ensure_ascii=False),

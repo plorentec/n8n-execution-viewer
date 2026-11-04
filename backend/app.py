@@ -13,8 +13,12 @@ Environment:
   N8N_VIEWER_SYNC_INTERVAL seconds between automatic syncs (default 300)
   N8N_VIEWER_PAGE_SIZE     executions per page (default 50)
   N8N_VIEWER_RETENTION_DAYS keep history this many days; 0 = keep forever (default)
+  N8N_VIEWER_MAX_BLOB_MB   cap for one execution payload in MB (default 50):
+                           bigger blobs are not copied, the execution is
+                           stored as data_missing with a parse_error reason
 """
 import json
+import logging
 import os
 import re
 import shutil
@@ -38,10 +42,49 @@ CONFIG = {
     "sync_interval": int(os.environ.get("N8N_VIEWER_SYNC_INTERVAL", "300")),
     "page_size": int(os.environ.get("N8N_VIEWER_PAGE_SIZE", "50")),
     "retention_days": int(os.environ.get("N8N_VIEWER_RETENTION_DAYS", "0")),
+    "max_blob_mb": int(os.environ.get("N8N_VIEWER_MAX_BLOB_MB", "50")),
     "brand": None,  # set from config.json at startup, or via POST /api/config
 }
 
+LOG = logging.getLogger("n8n-viewer")
+
+# S6: space reclamation after a retention pass.
+#
+# Two steps, both only ever run by apply_retention() from the sync thread
+# (never from a request handler), and only when the pass actually deleted
+# rows: merge the FTS5 index with its own `optimize` command, then give the
+# freed pages back to the operating system.
+#
+# Why PRAGMA incremental_vacuum and not VACUUM:
+#   * VACUUM rewrites the whole database in one step. On a 600 MB history
+#     that needs a second full copy on disk (peak usage 2x, a real
+#     SQLITE_FULL risk on a small VM), it cannot be split into pieces and it
+#     holds the write lock for the entire copy.
+#   * incremental_vacuum returns free pages in short batches. It runs here in
+#     a single write transaction with a page budget and a wall-clock budget,
+#     so the sync thread never owns the write lock for more than a few
+#     seconds; the sync lock already serializes every writer and WAL keeps
+#     readers (the HTTP handlers) serving their snapshots meanwhile.
+#     Measured on this machine: ~50k pages/s once the loop runs inside one
+#     transaction (a 49 MB test history reclaimed 9000 pages in ~0.2 s).
+#   * The FTS5 `optimize` merge itself is proportional to the index size and
+#     runs before the pages above can be released; it is a plain write too,
+#     so it costs the sync thread time but never blocks a reader.
+# The trade-off: incremental_vacuum only works on a database created with
+# PRAGMA auto_vacuum=INCREMENTAL (what schema.SCHEMA now does). A history
+# created by an older version has auto_vacuum=NONE, so its free pages can
+# never be returned without one file rewrite: that case is converted once
+# with a guarded VACUUM (see _legacy_vacuum) and is incremental from then on.
+INCREMENTAL_VACUUM_PAGES = 200    # pages per pragma call (SQLite frees >= 1)
+RECLAIM_MAX_PAGES = 500_000       # hard cap per pass (~2 GB at 4 KiB pages)
+RECLAIM_BUDGET_S = 5.0            # wall-clock cap per pass
+LEGACY_VACUUM_MIN_BYTES = 8 << 20  # rewrite a legacy file only for >= 8 MB
+LEGACY_VACUUM_DISK_FACTOR = 2.2    # VACUUM needs room for a second copy
+
 MAX_CONFIG_BYTES = 2 * 1024 * 1024  # logo data-URLs are the only big payload
+# S2: largest request body worth swallowing before answering early (403/409/
+# 413/404). Anything bigger closes the connection instead of buffering it.
+MAX_DRAIN_BYTES = 8 * 1024 * 1024
 
 
 def _config_file():
@@ -119,8 +162,15 @@ class State:
 STATE = State()
 
 
-def history():
-    con = sqlite3.connect(CONFIG["history_db"], timeout=15)
+def history(isolation_level=""):
+    """Connection to the viewer history database.
+
+    `isolation_level=None` switches sqlite3 to explicit transaction control
+    (the caller issues BEGIN/COMMIT); the default keeps its implicit "BEGIN
+    before a DML statement" convenience used by the short-lived helpers.
+    """
+    con = sqlite3.connect(CONFIG["history_db"], timeout=15,
+                          isolation_level=isolation_level)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout=15000")
     return con
@@ -151,8 +201,14 @@ def _sync_body():
     try:
         set_state("running", "1")
         STATE.step = "fetch"
-        result = syncmod.run_sync(CONFIG["n8n_db"], CONFIG["history_db"], progress)
-        result["retentionDeleted"] = apply_retention()
+        # S7: one cutoff for the whole pass, so the rows the import skips and
+        # the rows retention deletes share the exact same boundary.
+        cutoff = _retention_cutoff()
+        result = syncmod.run_sync(
+            CONFIG["n8n_db"], CONFIG["history_db"], progress,
+            retention_cutoff=cutoff,
+            max_blob_bytes=CONFIG.get("max_blob_mb", 50) * 1024 * 1024)
+        result["retentionDeleted"] = apply_retention(cutoff)
         set_state("last_ok", "1")
         set_state("last_error", "")
         set_state("last_result", json.dumps(result))
@@ -166,34 +222,161 @@ def _sync_body():
         STATE.step = ""
 
 
-def apply_retention():
-    """S6: drop history older than N8N_VIEWER_RETENTION_DAYS (0 = keep all).
+def _retention_cutoff():
+    """The date/time boundary retention uses, or None when it is off.
 
-    Runs while the sync lock is held. Deletes only from this viewer's own
-    history, never from n8n's database. fts_executions and executions_data
-    are cleaned explicitly (the fts5 table has no foreign keys and the
-    per-connection foreign_keys pragma is not guaranteed), so the deletions
-    are deterministic regardless of pragma state.
+    Stored the same way n8n stores startedAt, so the import skip (S7) and
+    the delete compare against exactly the same string.
     """
     days = CONFIG.get("retention_days", 0)
     if days <= 0:
-        return 0
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
+        return None
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
         "%Y-%m-%d %H:%M:%S.000")
-    con = history()
+
+
+def _incremental_vacuum(con):
+    """Return the free pages to the file system in bounded batches.
+
+    One write transaction, a page budget and a wall-clock budget: the sync
+    thread never holds the write lock for long, and WAL keeps the readers
+    working. Whatever is left over when a budget runs out is reclaimed by the
+    following retention pass (the free pages stay reusable meanwhile).
+    Returns the number of pages freed.
+    """
+    started = time.monotonic()
+    freed = 0
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        while freed < RECLAIM_MAX_PAGES:
+            before = con.execute("PRAGMA freelist_count").fetchone()[0]
+            if before <= 0:
+                break
+            con.execute(f"PRAGMA incremental_vacuum({INCREMENTAL_VACUUM_PAGES})")
+            after = con.execute("PRAGMA freelist_count").fetchone()[0]
+            freed += before - after
+            if after >= before or time.monotonic() - started > RECLAIM_BUDGET_S:
+                break
+        con.execute("COMMIT")
+    except sqlite3.Error:
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    return freed
+
+
+def _legacy_vacuum(con):
+    """Convert a pre-S6 history (auto_vacuum=NONE) so it can be compacted.
+
+    Such a file can only lose its free pages through one full rewrite, so it
+    happens once: `PRAGMA auto_vacuum=INCREMENTAL` is stored by the following
+    VACUUM and every later pass uses _incremental_vacuum. Guarded because
+    VACUUM needs room for a second copy of the live data: it only runs when
+    there is something worth reclaiming and the disk can hold the copy.
+    Returns a short description for the log.
+    """
+    page_size = con.execute("PRAGMA page_size").fetchone()[0]
+    free_pages = con.execute("PRAGMA freelist_count").fetchone()[0]
+    reclaimable = free_pages * page_size
+    if reclaimable < LEGACY_VACUUM_MIN_BYTES:
+        return f"legacy skip: {reclaimable} bytes to reclaim"
+    db_path = CONFIG["history_db"]
+    try:
+        db_bytes = os.path.getsize(db_path)
+        free_disk = shutil.disk_usage(os.path.dirname(os.path.abspath(db_path))).free
+    except OSError as e:
+        return f"legacy skip: {e}"
+    if free_disk < db_bytes * LEGACY_VACUUM_DISK_FACTOR:
+        return (f"legacy skip: VACUUM needs {int(db_bytes * LEGACY_VACUUM_DISK_FACTOR)} "
+                f"free bytes, {free_disk} available")
+    con.execute("PRAGMA auto_vacuum=INCREMENTAL")
+    con.execute("VACUUM")
+    return f"legacy converted: {reclaimable} bytes rewrote the file once"
+
+
+def _reclaim_history_space(con):
+    """S6: give back what a retention delete freed.
+
+    Called only by apply_retention() (sync thread, sync lock held) and only
+    when that pass deleted rows: a no-op pass never touches the file.
+    """
+    # 1) merge the FTS5 segments: deleting rows only marks their entries as
+    #    gone, the text stays inside the on-disk segments until they merge.
+    con.execute("INSERT INTO fts_executions(fts_executions) VALUES('optimize')")
+    # 2) return the freed pages to the OS (see the trade-off note at the top)
+    mode = con.execute("PRAGMA auto_vacuum").fetchone()[0]
+    if mode == 2:
+        detail = f"incremental: {_incremental_vacuum(con)} pages freed"
+    else:
+        detail = _legacy_vacuum(con)
+    # 3) in WAL mode the main file only loses its pages on a checkpoint
+    try:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error as e:
+        detail += f" (checkpoint failed: {e})"
+    LOG.info("retention reclaim: %s", detail)
+    return detail
+
+
+def apply_retention(cutoff=None):
+    """S6: drop history older than N8N_VIEWER_RETENTION_DAYS (0 = keep all).
+
+    Runs while the sync lock is held, never from a request handler. Deletes
+    only from this viewer's own history, never from n8n's database.
+    fts_executions and executions_data are cleaned explicitly (the fts5 table
+    has no foreign keys and the per-connection foreign_keys pragma is not
+    guaranteed), so the deletions are deterministic regardless of pragma
+    state. When rows were deleted the freed disk space is reclaimed
+    (_reclaim_history_space); a pass that deletes nothing does no work.
+
+    `cutoff` is the boundary sync.run_sync used to skip expired rows (S7);
+    when omitted it is derived from the configured retention days.
+    """
+    if cutoff is None:
+        cutoff = _retention_cutoff()
+    if cutoff is None:
+        return 0
+    # Explicit transaction control: the SELECT below must not sit inside
+    # sqlite3's implicit transaction, and the deletion batch has to be one
+    # atomic unit (BEGIN ... COMMIT) that a failure rolls back as a whole.
+    con = history(isolation_level=None)
     try:
         ids = [r[0] for r in con.execute(
             "SELECT id FROM executions WHERE started_at < ?", (cutoff,))]
         if not ids:
             return 0
-        con.execute("BEGIN")
-        for i in range(0, len(ids), 500):
-            chunk = ids[i:i + 500]
-            marks = ",".join("?" * len(chunk))
-            con.execute(f"DELETE FROM fts_executions WHERE execution_id IN ({marks})", chunk)
-            con.execute(f"DELETE FROM executions_data WHERE execution_id IN ({marks})", chunk)
-            con.execute(f"DELETE FROM executions WHERE id IN ({marks})", chunk)
-        con.commit()
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                marks = ",".join("?" * len(chunk))
+                # S4: this index stores execution_id as TEXT (fts5 columns have
+                # no type affinity), so it must be matched with TEXT too;
+                # integers would never match and the cleanup would be a no-op.
+                con.execute(
+                    f"DELETE FROM fts_executions WHERE execution_id IN ({marks})",
+                    [str(i) for i in chunk])
+                con.execute(
+                    f"DELETE FROM executions_data WHERE execution_id IN ({marks})",
+                    chunk)
+                con.execute(
+                    f"DELETE FROM executions WHERE id IN ({marks})", chunk)
+            con.execute("COMMIT")
+        except BaseException:
+            try:
+                con.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass  # sqlite3 may have rolled back on its own already
+            raise
+        # only past this point: the rows are really gone
+        try:
+            _reclaim_history_space(con)
+        except sqlite3.Error as e:
+            # the history is already clean; a failed compaction is not worth
+            # failing the sync over (the next pass retries it)
+            LOG.warning("retention reclaim failed: %s: %s", type(e).__name__, e)
         return len(ids)
     finally:
         con.close()
@@ -304,7 +487,7 @@ def node_io_view(parsed, name, run_index):
     runs = run_data.get(name)
     if runs is None:
         raise LookupError(f"node {name} not found in execution")
-    if not isinstance(runs, list) or run_index >= len(runs):
+    if not isinstance(runs, list) or run_index < 0 or run_index >= len(runs):
         raise LookupError(f"run {run_index} not found for node {name}")
     run = runs[run_index]
     if not isinstance(run, dict):
@@ -395,11 +578,50 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if self.close_connection:
+            # say it out loud: the client must not reuse this connection
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
     def _error(self, code, message):
         self._send(code, {"error": message})
+
+    def _content_length(self):
+        """S3: Content-Length as a non-negative int, or None when the header
+        is non-numeric or negative (the caller answers 400: reading a bogus
+        length would block the thread or eat the next request)."""
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            return 0
+        try:
+            length = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return length if length >= 0 else None
+
+    def _drain_body(self, length):
+        """S2: consume the request body before answering early.
+
+        protocol_version is HTTP/1.1, so the connection is kept alive and any
+        unread body byte would be parsed as the start of the next request
+        (a POST with a body followed by another request on the same socket
+        desynchronizes). Bodies above MAX_DRAIN_BYTES are not swallowed: the
+        connection is closed instead. Common cases (403/409/413) are well
+        inside that limit.
+        """
+        if length <= 0:
+            return
+        if length > MAX_DRAIN_BYTES:
+            self.close_connection = True
+            return
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 64 * 1024))
+            if not chunk:
+                self.close_connection = True
+                return
+            remaining -= len(chunk)
 
     # -- GET routes --
 
@@ -434,7 +656,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        length = self._content_length()
+        if length is None:
+            # S3: the body boundary is unknown, so the stream cannot be
+            # resynchronized: answer 400 and close.
+            self.close_connection = True
+            return self._error(400, "invalid Content-Length header")
         if path == "/api/sync":
+            self._drain_body(length)  # no endpoint here reads a body
             if self.headers.get("x-viewer-action") != "sync":
                 return self._error(403, "x-viewer-action: sync header required")
             if not start_sync():
@@ -442,16 +671,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True})
         if path == "/api/config":
             if self.headers.get("x-viewer-action") != "config":
+                self._drain_body(length)
                 return self._error(403, "x-viewer-action: config header required")
-            return self._save_config()
+            return self._save_config(length)
+        self._drain_body(length)
         return self._error(404, "not found")
 
-    def _save_config(self):
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            length = 0
+    def _save_config(self, length):
         if length > MAX_CONFIG_BYTES:
+            self._drain_body(length)
             return self._error(413, "payload too large")
         try:
             raw = self.rfile.read(length) if length else b""
