@@ -108,24 +108,57 @@ $("wf-collapse").addEventListener("click", () => setWorkflowsCollapsed(true));
 $("wf-expand").addEventListener("click", () => setWorkflowsCollapsed(false));
 $("focus-toggle").addEventListener("click", () => setFocus(!document.body.classList.contains("focus-mode")));
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape" && document.body.classList.contains("focus-mode")) setFocus(false);
+  if (ev.key !== "Escape") return;
+  // S12: while the settings dialog is open it owns Escape (it closes itself and
+  // gives the focus back), so Esc there must not also leave focus mode.
+  if (!$("settings-overlay").hidden) return;
+  if (document.body.classList.contains("focus-mode")) setFocus(false);
 });
 
 // ---------- routing (hash keeps deep links and the back button working) ----------
 
+// Filter fields that travel in the hash too, so a shared link keeps them (S14).
+const FILTER_KEYS = ["q", "status", "from", "to"];
+
 function readHash() {
   const p = new URLSearchParams(location.hash.slice(1));
-  return { workflow: p.get("wf") ?? "", exec: p.get("exec"), node: p.get("node"), run: Number(p.get("run") ?? 0) };
+  const filters = {};
+  for (const key of FILTER_KEYS) {
+    const v = p.get(key);
+    if (v) filters[key] = v;
+  }
+  return {
+    workflow: p.get("wf") ?? "", exec: p.get("exec"), node: p.get("node"),
+    run: Number(p.get("run") ?? 0), filters,
+  };
 }
 
 function writeHash() {
   const p = new URLSearchParams();
   if (state.workflow) p.set("wf", state.workflow);
+  // S14: the search/status filters (and the date range) are part of the link.
+  for (const key of FILTER_KEYS) {
+    const v = state.filters[key];
+    if (v) p.set(key, v);
+  }
   if (state.exec) p.set("exec", state.exec);
   if (state.node) p.set("node", state.node);
   if (state.node && state.run) p.set("run", state.run);
   const next = `#${p}`;
   if (location.hash !== next) history.pushState(null, "", next);
+}
+
+function sameFilters(a, b) {
+  return FILTER_KEYS.every((key) => (a[key] ?? "") === (b[key] ?? ""));
+}
+
+// The form is the visible source of truth: a deep link has to fill it in.
+function fillFilters(filters) {
+  const form = $("filters");
+  for (const key of FILTER_KEYS) {
+    const field = form.elements.namedItem(key);
+    if (field && "value" in field) field.value = filters[key] ?? "";
+  }
 }
 
 // ---------- JSON tree (children are built lazily, on first open) ----------
@@ -171,16 +204,83 @@ function jsonTree(value, key = null, depth = 0) {
   return details;
 }
 
-function copyButton(getValue) {
-  const btn = el("button", { class: "copy", text: "Copiar JSON" });
-  btn.addEventListener("click", async () => {
+function jsonText(value) {
+  const out = JSON.stringify(value, null, 2);
+  return out === undefined ? String(value) : out;
+}
+
+// S13: navigator.clipboard only exists on secure origins, so from
+// http://192.168.x.x every copy failed. Select a hidden textarea and let the
+// legacy command do the work.
+function copyWithSelection(text) {
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  // Fixed position keeps the page from scrolling while the text is selected.
+  area.style.position = "fixed";
+  area.style.top = "0";
+  area.style.left = "-9999px";
+  area.style.opacity = "0";
+  document.body.append(area);
+  let ok = false;
+  try {
+    area.focus({ preventScroll: true });
+    area.select();
+    area.setSelectionRange(0, area.value.length);
+    ok = document.execCommand("copy");
+  } catch {
+    ok = false;
+  }
+  area.remove();
+  return ok;
+}
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
     try {
-      await navigator.clipboard.writeText(JSON.stringify(getValue(), null, 2));
-      btn.textContent = "Copiado ✓";
+      await navigator.clipboard.writeText(text);
+      return true;
     } catch {
-      btn.textContent = "No se pudo copiar";
+      // Permission denied or blocked: fall through to the selection copy.
     }
+  }
+  return copyWithSelection(text);
+}
+
+function copyButton(getValue) {
+  const btn = el("button", { class: "copy", type: "button", text: "Copiar JSON" });
+  btn.addEventListener("click", async () => {
+    const ok = await copyText(jsonText(getValue()));
+    btn.textContent = ok ? "Copiado ✓" : "No se pudo copiar";
     setTimeout(() => (btn.textContent = "Copiar JSON"), 1500);
+  });
+  return btn;
+}
+
+// File names for downloads: keep the execution id, drop what a filesystem (or a
+// node name with spaces and accents) would turn into a mess.
+function jsonFilename(...parts) {
+  const slug = parts
+    .map((p) => String(p ?? "")
+      .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^\w.-]+/g, "_")
+      .replace(/^_+|_+$/g, ""))
+    .filter(Boolean)
+    .join("-");
+  return `${slug || "ejecucion"}.json`;
+}
+
+function downloadButton(getValue, filename) {
+  const btn = el("button", { class: "copy", type: "button", text: "Descargar JSON" });
+  btn.addEventListener("click", () => {
+    const blob = new Blob([jsonText(getValue())], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = el("a", { href: url, download: filename });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    // Let the browser start the download before the URL goes away.
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
   });
   return btn;
 }
@@ -374,7 +474,13 @@ function execQuery() {
   return p;
 }
 
+// S10: only the newest load may touch the list. A slow response that lands
+// after a newer one ("Cargar más" then a filter, or two quick filter submits)
+// is dropped instead of appending stale rows over the fresh list.
+let execLoadSeq = 0;
+
 async function loadExecutions(reset) {
+  const seq = ++execLoadSeq;
   const list = $("exec-list");
   if (reset) {
     state.nextBefore = null;
@@ -386,6 +492,7 @@ async function loadExecutions(reset) {
   $("exec-title").textContent = wf ? wf.name : "Todas las ejecuciones";
   try {
     const page = await api(`/api/executions?${execQuery()}`);
+    if (seq !== execLoadSeq) return;
     if (reset) setChildren(list);
     if (reset && page.items.length === 0) {
       list.append(el("li", { class: "empty", text: "Sin ejecuciones para estos filtros." }));
@@ -397,6 +504,17 @@ async function loadExecutions(reset) {
     $("exec-count").textContent = `${nf.format(state.shown)}${page.nextBefore ? "+" : ""} mostradas`;
     markSelectedExecution();
   } catch (e) {
+    if (seq !== execLoadSeq) return;
+    if (!reset) {
+      // S11: a failed "Cargar más" must not throw away what is already loaded;
+      // keep the rows and warn at the bottom (one notice, not one per attempt).
+      for (const old of list.querySelectorAll(":scope > .exec-error")) old.remove();
+      list.append(el("li", { class: "exec-error" },
+        el("div", { class: "error-box", text: `Error: ${e.message}` })));
+      // Scroll the list itself (never the page) so the notice is visible.
+      list.scrollTop = list.scrollHeight;
+      return;
+    }
     showError(list, e);
   }
 }
@@ -788,18 +906,23 @@ const countOutput = (output) => Object.values(output ?? {})
 function renderNode(io) {
   const runsCount = state.runs[io.node] ?? 1;
   const tabs = [
-    ["Entrada", countInput(io.input), () => inputView(io.input), io.input],
-    ["Salida", countOutput(io.output), () => outputView(io.output), io.output],
-    ["Parámetros", null, () => jsonTree(io.parameters ?? {}, null, 0), io.parameters],
+    ["Entrada", countInput(io.input), () => inputView(io.input), io.input, "entrada"],
+    ["Salida", countOutput(io.output), () => outputView(io.output), io.output, "salida"],
+    ["Parámetros", null, () => jsonTree(io.parameters ?? {}, null, 0), io.parameters, "parametros"],
   ];
-  if (io.error) tabs.push(["Error", null, () => jsonTree(io.error, null, 0), io.error]);
+  if (io.error) tabs.push(["Error", null, () => jsonTree(io.error, null, 0), io.error, "error"]);
 
   const body = el("div", { class: "tab-body" });
   const bar = el("div", { class: "tabs" });
   const show = (i) => {
     bar.querySelectorAll(".tab").forEach((t, j) => t.classList.toggle("selected", i === j));
-    const [, , render, raw] = tabs[i];
-    setChildren(body, el("div", { class: "tab-tools" }, copyButton(() => raw)), render());
+    const [, , render, raw, slug] = tabs[i];
+    // S14: copy and download share the same JSON; both are named after the execution.
+    setChildren(body,
+      el("div", { class: "tab-tools" },
+        copyButton(() => raw),
+        downloadButton(() => raw, jsonFilename("ejecucion", state.exec, io.node, slug, `run${io.run}`))),
+      render());
   };
   tabs.forEach(([label, n], i) => bar.append(el("button", { type: "button", class: "tab", onclick: () => show(i) },
     label, n == null ? null : el("span", { class: "n", text: nf.format(n) }))));
@@ -854,20 +977,25 @@ $("exec-more").addEventListener("click", () => loadExecutions(false));
 $("filters").addEventListener("submit", (ev) => {
   ev.preventDefault();
   state.filters = Object.fromEntries(new FormData(ev.target));
+  writeHash();
   loadExecutions(true);
 });
 $("f-clear").addEventListener("click", () => {
   $("filters").reset();
   state.filters = {};
+  writeHash();
   loadExecutions(true);
 });
 
 async function applyHash() {
   const h = readHash();
   const workflowChanged = h.workflow !== state.workflow;
+  const filtersChanged = !sameFilters(h.filters, state.filters);
   state.workflow = h.workflow;
+  state.filters = h.filters;
+  fillFilters(h.filters);
   renderWorkflows();
-  if (workflowChanged || !$("exec-list").children.length) await loadExecutions(true);
+  if (workflowChanged || filtersChanged || !$("exec-list").children.length) await loadExecutions(true);
   if (!h.exec) return renderDetailEmpty();
   if (h.exec !== state.exec) return selectExecution(h.exec, h.node, h.run);
   if (h.node && (h.node !== state.node || h.run !== state.run)) return selectNode(h.node, h.run);
@@ -921,10 +1049,16 @@ function setSettingsMsg(text, isErr) {
   msg.classList.toggle("err", !!isErr);
 }
 
+const FOCUSABLE_SELECTOR = "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])";
+
+// S12: aria-modal tells assistive tech that the page behind is inert, so focus
+// has to move into the dialog, stay there while it is open, and come back to
+// the button that opened it.
 async function openSettings() {
   $("settings-overlay").hidden = false;
   setSettingsMsg("");
   $("settings-save").disabled = true;
+  $("cfg-retention").focus({ preventScroll: true });
   try {
     const cfg = await api("/api/config");
     const days = cfg.retentionDays ?? 0;
@@ -935,7 +1069,12 @@ async function openSettings() {
     const b = cfg.brand || {};
     $("cfg-title").value = b.title || "";
     $("cfg-subtitle").value = b.subtitle || "";
-    showLogoPreview(b.logo || null);
+    // S9: remember what the server has; this session starts with no logo change.
+    storedLogo = b.logo || null;
+    pendingLogo = null;
+    logoCleared = false;
+    $("cfg-logo-file").value = "";
+    showLogoPreview(storedLogo);
   } catch (e) {
     setSettingsMsg(`No se pudieron cargar: ${e.message}`, true);
     return;
@@ -943,7 +1082,27 @@ async function openSettings() {
   $("settings-save").disabled = false;
 }
 
-function closeSettings() { $("settings-overlay").hidden = true; }
+function closeSettings() {
+  $("settings-overlay").hidden = true;
+  $("settings-btn").focus({ preventScroll: true });
+}
+
+// Tab circulates inside the dialog instead of reaching the page behind it.
+function trapFocus(ev) {
+  const modal = document.querySelector("#settings-overlay .modal");
+  if (!modal) return;
+  const items = [...modal.querySelectorAll(FOCUSABLE_SELECTOR)]
+    .filter((n) => !n.disabled && n.offsetParent !== null);
+  if (!items.length) return;
+  const first = items[0];
+  const last = items[items.length - 1];
+  const current = document.activeElement;
+  const outside = !modal.contains(current);
+  if (ev.shiftKey ? current === first || outside : current === last || outside) {
+    ev.preventDefault();
+    (ev.shiftKey ? last : first).focus({ preventScroll: true });
+  }
+}
 
 function showLogoPreview(dataUrl) {
   const img = $("cfg-logo-preview");
@@ -952,11 +1111,9 @@ function showLogoPreview(dataUrl) {
   else { img.hidden = true; img.removeAttribute("src"); clear.hidden = true; }
 }
 
+let storedLogo = null; // logo the server has right now (captured when the dialog opens)
 let pendingLogo = null; // dataURL chosen in this session, not yet saved
-
-function currentLogoDataUrl() {
-  return pendingLogo; // null = clear
-}
+let logoCleared = false; // the user pressed "Quitar" in this session
 
 async function saveSettings() {
   const sel = $("cfg-retention");
@@ -969,14 +1126,17 @@ async function saveSettings() {
   } else {
     days = parseInt(sel.value, 10);
   }
-  const payload = {
-    retentionDays: days,
-    brand: {
-      title: $("cfg-title").value.trim(),
-      subtitle: $("cfg-subtitle").value.trim(),
-      logo: currentLogoDataUrl(),
-    },
+  const brand = {
+    title: $("cfg-title").value.trim(),
+    subtitle: $("cfg-subtitle").value.trim(),
   };
+  // S9: only touch the logo when the user changed it. Sending null for "nothing
+  // picked in this session" made the backend delete the stored logo.
+  if (pendingLogo) brand.logo = pendingLogo;
+  else if (logoCleared) brand.logo = null; // "Quitar" is the explicit clear
+  else if (storedLogo) brand.logo = storedLogo; // unchanged: keep what is stored
+  // Nothing stored and nothing picked: omit the field and let the server decide.
+  const payload = { retentionDays: days, brand };
   $("settings-save").disabled = true;
   setSettingsMsg("");
   try {
@@ -987,7 +1147,9 @@ async function saveSettings() {
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+    storedLogo = brand.logo ?? null;
     pendingLogo = null;
+    logoCleared = false;
     await applyBrand();
     await loadStats(); // refresh the disk card label (retention)
     setSettingsMsg("Guardado.");
@@ -1007,7 +1169,11 @@ function initSettings() {
     if (e.target.id === "settings-overlay") closeSettings();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !$("settings-overlay").hidden) closeSettings();
+    // S12: while the dialog is open it owns the keyboard. The focus-mode Escape
+    // handler above skips the key when this overlay is visible.
+    if ($("settings-overlay").hidden) return;
+    if (e.key === "Escape") return closeSettings();
+    if (e.key === "Tab") return trapFocus(e);
   });
   $("cfg-retention").addEventListener("change", (e) => {
     $("cfg-retention-custom").hidden = e.target.value !== RETENTION_CUSTOM;
@@ -1021,11 +1187,17 @@ function initSettings() {
       return;
     }
     const reader = new FileReader();
-    reader.onload = () => { pendingLogo = reader.result; showLogoPreview(pendingLogo); setSettingsMsg(""); };
+    reader.onload = () => {
+      pendingLogo = reader.result;
+      logoCleared = false;
+      showLogoPreview(pendingLogo);
+      setSettingsMsg("");
+    };
     reader.readAsDataURL(file);
   });
   $("cfg-logo-clear").addEventListener("click", () => {
     pendingLogo = null;
+    logoCleared = true;
     $("cfg-logo-file").value = "";
     showLogoPreview(null);
   });

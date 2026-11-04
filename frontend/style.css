@@ -226,6 +226,8 @@ body.theme-dark input[type="date"] { color-scheme: dark; }
 .error-box, .warn-box { padding: 10px 12px; border-radius: 10px; white-space: pre-wrap; word-break: break-word; font-size: 13px; border: 1px solid; }
 .error-box { background: rgba(224, 57, 62, .08); color: var(--fail); border-color: rgba(224, 57, 62, .3); }
 .warn-box { background: rgba(217, 119, 6, .08); color: var(--warn); border-color: rgba(217, 119, 6, .3); }
+/* A failed "Cargar más" is appended under the rows instead of replacing them (S11). */
+.exec-error { padding: 10px 12px; }
 
 /* ---- Execution detail ---- */
 .panel.detail { overflow: hidden; }
@@ -280,7 +282,7 @@ body.theme-dark input[type="date"] { color-scheme: dark; }
 .tab.selected { color: var(--text); border-bottom-color: var(--accent); }
 .tab .n { font-size: 11px; background: var(--sunken); color: var(--text-2); border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; }
 .tab-body { padding: 14px 18px 24px; }
-.tab-tools { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+.tab-tools { display: flex; gap: 6px; justify-content: flex-end; margin-bottom: 8px; }
 .copy { font-size: 12px; font-weight: 700; color: var(--primary); padding: 5px 10px; border-radius: 8px; transition: background .12s; }
 .copy:hover { background: rgba(11, 108, 180, .1); }
 .io-block { margin-bottom: 18px; }
