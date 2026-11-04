@@ -49,7 +49,7 @@ here after n8n has forgotten them.
 On the machine where n8n runs:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/<user>/n8n-execution-viewer/main/install.sh | sudo bash -s --
+curl -fsSL https://raw.githubusercontent.com/plorentec/n8n-execution-viewer/main/install.sh | sudo bash -s --
 ```
 
 The installer will:
