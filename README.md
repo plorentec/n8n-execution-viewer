@@ -188,6 +188,7 @@ Open `https://your-host/n8n-viewer/`.
 | `N8N_VIEWER_SYNC_INTERVAL` | `300` | seconds between automatic syncs |
 | `N8N_VIEWER_PAGE_SIZE` | `50` | executions per page |
 | `N8N_VIEWER_RETENTION_DAYS` | `0` | keep the history this many days; `0` = keep forever. After each sync, older rows are dropped from the history (never from n8n's own database). Also `--retention-days N` in `install.sh` |
+| `N8N_VIEWER_MAX_BLOB_MB` | `50` | skip the payload of any execution whose stored data is larger than this. The execution still appears in the list, marked as having no data, instead of being loaded and re-serialized in memory |
 
 ### Branding (logo and title)
 
@@ -230,7 +231,9 @@ retention in the card label.
   (diagram data) and the error box
 - `GET /api/executions/:id/nodes/:name?run=N` — node input (derived from
   the source run, or `inputOverride`), output, parameters, error
-- `GET /api/sync` — running/step/last run result
+- `GET /api/sync` — running/step/last run result (`retentionDeleted` rows dropped by the
+  retention window, `retentionSkipped` executions too old to import again,
+  `oversizedBlobs` payloads skipped by `N8N_VIEWER_MAX_BLOB_MB`)
 - `POST /api/sync` (header `x-viewer-action: sync`) — trigger a sync now;
   `409` while one is running
 - `GET /api/config` — current `retentionDays` + `brand` (title/subtitle/logo)
