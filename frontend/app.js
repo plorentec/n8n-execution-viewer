@@ -81,8 +81,20 @@ const pill = (cls, text) => el("span", { class: `pill ${cls}`, text });
 const statusPill = (s) => pill(s ?? "unknown", STATUS_LABEL[s] ?? s ?? STATUS_LABEL.unknown);
 const loading = (text = "Cargando…") => el("div", { class: "loading" }, el("span", { class: "spinner" }), text);
 
-function showError(container, err) {
-  setChildren(container, el("div", { class: "error-box", text: `Error: ${err.message}` }));
+// S32/S33: every load error is announced to assistive tech and carries a
+// "Reintentar" button that re-runs the loader that failed. The message names
+// what could not be loaded, so the retry is not a mystery.
+function errorBox(err, { retry = null, what = "Error" } = {}) {
+  return el("div", { class: "error-box", role: "alert" },
+    el("div", { text: `${what}: ${err.message}` }),
+    retry
+      ? el("button", { type: "button", class: "btn btn-ghost retry", text: "Reintentar",
+          onclick: () => retry() })
+      : null);
+}
+
+function showError(container, err, options) {
+  setChildren(container, errorBox(err, options));
 }
 
 // ---------- theme  ----------
@@ -133,7 +145,10 @@ function readHash() {
   };
 }
 
-function writeHash() {
+// S34: only opening an execution is a navigation step, so only that pushes a
+// history entry. Picking a node/run or changing a filter replaces the current
+// entry: "atrás" leaves the viewer instead of replaying every click.
+function writeHash({ push = false } = {}) {
   const p = new URLSearchParams();
   if (state.workflow) p.set("wf", state.workflow);
   // S14: the search/status filters (and the date range) are part of the link.
@@ -145,7 +160,9 @@ function writeHash() {
   if (state.node) p.set("node", state.node);
   if (state.node && state.run) p.set("run", state.run);
   const next = `#${p}`;
-  if (location.hash !== next) history.pushState(null, "", next);
+  if (location.hash === next) return;
+  if (push) history.pushState(null, "", next);
+  else history.replaceState(null, "", next);
 }
 
 function sameFilters(a, b) {
@@ -319,16 +336,22 @@ const SYNC_STEP = {
   fetch: "Trayendo copia de n8n…", import: "Integrando en el histórico…",
 };
 let lastStats = null;
+let lastSync = null;
+
+function syncTitle(s) {
+  return s?.fetchConfigured
+    ? "Ejecutar el flujo de copia de n8n e integrar la copia nueva en el histórico"
+    : "No hay origen configurado: solo reintegra la última copia descargada";
+}
 
 function renderSync(s) {
   const btn = $("sync-btn");
+  lastSync = s;
   btn.disabled = s.running;
   btn.classList.toggle("running", s.running);
   $("sync-label").textContent = s.running ? SYNC_STEP[s.step] ?? "Actualizando…" : "Actualizar ahora";
   $("live-dot").className = `live-dot${s.running ? " running" : s.last && !s.last.ok ? " failed" : ""}`;
-  btn.title = s.fetchConfigured
-    ? "Ejecutar el flujo de copia de n8n e integrar la copia nueva en el histórico"
-    : "No hay origen configurado: solo reintegra la última copia descargada";
+  btn.title = syncTitle(s);
   if (s.running) return;
   if (s.last && !s.last.ok) {
     $("live-txt").textContent = `Falló la actualización (${s.last.step === "import" ? "al integrarla" : "al traer la copia"}): ${s.last.error}`;
@@ -348,31 +371,72 @@ function renderLive(stats, lastRun) {
     : range;
 }
 
-let watching = false;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const SYNC_POLL_MS = 2000;
+// S24: a network blip must not leave the button dead forever. The loop keeps
+// polling (the sync runs on the server whether we watch it or not) with a
+// growing pause, so it heals by itself when the network comes back.
+const SYNC_POLL_BACKOFF = [2000, 5000, 15000, 30000];
+// A post-sync refresh that a failed poll made us skip stays owed, so the next
+// watch that ends well still refreshes the list instead of losing it for good.
+let syncRefreshOwed = false;
+// A newer watch supersedes a running one, so clicking the button always works,
+// even while an older loop is still retrying a failed poll.
+let watchGen = 0;
+
+// S24: the poll failed, so say what happened and put the button back to work.
+function renderSyncFailed(err) {
+  const btn = $("sync-btn");
+  btn.disabled = false;
+  btn.classList.remove("running");
+  $("sync-label").textContent = "Actualizar ahora";
+  btn.title = syncTitle(lastSync);
+  $("live-dot").className = `live-dot${lastSync?.last && !lastSync.last.ok ? " failed" : ""}`;
+  $("live-txt").textContent = `No se pudo consultar el estado de la actualización: ${err.message}`;
+}
 
 // Follows a running sync until it ends; then refreshes figures and lists in place.
 async function watchSync({ refresh }) {
-  if (watching) return;
-  watching = true;
+  const gen = ++watchGen;
   let s = null;
+  let failures = 0;
   try {
     for (;;) {
-      s = await api("/api/sync");
+      let status = null;
+      let failure = null;
+      try {
+        status = await api("/api/sync");
+      } catch (e) {
+        failure = e;
+      }
+      // A newer watch took over while this request was in the air.
+      if (gen !== watchGen) return;
+      if (failure) {
+        failures++;
+        renderSyncFailed(failure);
+        if (refresh) syncRefreshOwed = true;
+        await sleep(SYNC_POLL_BACKOFF[Math.min(failures - 1, SYNC_POLL_BACKOFF.length - 1)]);
+        continue;
+      }
+      failures = 0;
+      s = status;
       renderSync(s);
       if (!s.running) break;
-      refresh = true;
-      await sleep(2000);
+      refresh = true; // a running sync has something new to show afterwards
+      await sleep(SYNC_POLL_MS);
     }
-    if (refresh && s.last?.ok) {
+    // Skipped when the polls failed (the state is unknown then), but never
+    // dropped: syncRefreshOwed carries it to the next watch that ends well.
+    if ((refresh || syncRefreshOwed) && s.last?.ok) {
+      syncRefreshOwed = false;
       await Promise.all([loadStats(), loadWorkflows()]);
       await loadExecutions(true);
       renderSync(s);
     }
-  } catch {
-    // Status is informative; the viewer keeps working without it.
-  } finally {
-    watching = false;
+  } catch (e) {
+    // Anything else that broke while following the sync: same recovery path.
+    renderSyncFailed(e);
   }
 }
 
@@ -450,7 +514,7 @@ async function loadWorkflows() {
     state.workflows = await api("/api/workflows");
     renderWorkflows();
   } catch (e) {
-    showError($("wf-list"), e);
+    showError($("wf-list"), e, { retry: loadWorkflows, what: "No se pudieron cargar los flujos" });
   }
 }
 
@@ -479,12 +543,32 @@ function execQuery() {
 // is dropped instead of appending stale rows over the fresh list.
 let execLoadSeq = 0;
 
+// S31: the list DOM keeps a fixed window of rows. Paging through thousands of
+// executions used to grow it without ceiling; dropping the oldest rows keeps
+// memory flat. A pruned page 1 is not reachable again, by design.
+const EXEC_DOM_WINDOW = 500;
+
+function pruneExecRows(list) {
+  const rows = [...list.children].filter((li) => li.querySelector(":scope > .exec-item"));
+  const extra = rows.length - EXEC_DOM_WINDOW;
+  if (extra <= 0) return;
+  for (const li of rows.slice(0, extra)) {
+    li.remove();
+    state.shown -= 1;
+  }
+}
+
 async function loadExecutions(reset) {
+  // S29: "Cargar más" needs a cursor. Without one (the initial load, or a reset
+  // that failed) a click would fetch page 1 again and duplicate the rows.
+  if (!reset && !state.nextBefore) return;
   const seq = ++execLoadSeq;
   const list = $("exec-list");
   if (reset) {
     state.nextBefore = null;
     state.shown = 0;
+    // S29: hide it as soon as a reset starts, not only when a page answers.
+    $("exec-more").hidden = true;
     setChildren(list, el("li", {}, loading()));
     $("exec-count").textContent = "";
   }
@@ -497,8 +581,11 @@ async function loadExecutions(reset) {
     if (reset && page.items.length === 0) {
       list.append(el("li", { class: "empty", text: "Sin ejecuciones para estos filtros." }));
     }
+    // S30: a load that works clears the notice a previous failed load left.
+    for (const old of list.querySelectorAll(":scope > .exec-error")) old.remove();
     for (const e of page.items) list.append(execRow(e));
     state.shown += page.items.length;
+    pruneExecRows(list);
     state.nextBefore = page.nextBefore;
     $("exec-more").hidden = !page.nextBefore;
     $("exec-count").textContent = `${nf.format(state.shown)}${page.nextBefore ? "+" : ""} mostradas`;
@@ -510,12 +597,12 @@ async function loadExecutions(reset) {
       // keep the rows and warn at the bottom (one notice, not one per attempt).
       for (const old of list.querySelectorAll(":scope > .exec-error")) old.remove();
       list.append(el("li", { class: "exec-error" },
-        el("div", { class: "error-box", text: `Error: ${e.message}` })));
+        errorBox(e, { retry: () => loadExecutions(false), what: "No se pudieron cargar más ejecuciones" })));
       // Scroll the list itself (never the page) so the notice is visible.
       list.scrollTop = list.scrollHeight;
       return;
     }
-    showError(list, e);
+    showError(list, e, { retry: () => loadExecutions(true), what: "No se pudieron cargar las ejecuciones" });
   }
 }
 
@@ -555,7 +642,8 @@ async function selectExecution(id, node = null, run = 0) {
   state.node = node;
   state.run = run;
   state.execData = null;
-  writeHash();
+  // S34: opening an execution is the only step that enters the history.
+  writeHash({ push: true });
   markSelectedExecution();
   setWorkflowsCollapsed(true);
   $("detail-empty").hidden = true;
@@ -569,7 +657,9 @@ async function selectExecution(id, node = null, run = 0) {
     renderExecution(e);
     if (node) selectNode(node, run);
   } catch (err) {
-    showError($("exec-head"), err);
+    // S25: a slow execution that fails must not paint over a newer selection.
+    if (state.exec !== String(id)) return;
+    showError($("exec-head"), err, { retry: () => selectExecution(id, node, run), what: `No se pudo cargar la ejecución #${id}` });
   }
 }
 
@@ -885,6 +975,7 @@ const diagram = (() => {
 async function selectNode(name, run) {
   state.node = name;
   state.run = run;
+  // S34: picking a node/run replaces the entry instead of adding one.
   writeHash();
   markSelectedNode();
   const panel = $("node-panel");
@@ -892,10 +983,13 @@ async function selectNode(name, run) {
   const execId = state.exec;
   try {
     const io = await api(`/api/executions/${encodeURIComponent(execId)}/nodes/${encodeURIComponent(name)}?run=${run}`);
-    if (state.exec !== execId || state.node !== name) return;
+    // S26: the run is part of the selection too, so two quick run clicks cannot
+    // cross-render (the first answer used to land after the second one).
+    if (state.exec !== execId || state.node !== name || state.run !== run) return;
     renderNode(io);
   } catch (e) {
-    showError(panel, e);
+    if (state.exec !== execId || state.node !== name || state.run !== run) return;
+    showError(panel, e, { retry: () => selectNode(name, run), what: `No se pudo cargar la caja "${name}"` });
   }
 }
 
@@ -996,7 +1090,17 @@ async function applyHash() {
   fillFilters(h.filters);
   renderWorkflows();
   if (workflowChanged || filtersChanged || !$("exec-list").children.length) await loadExecutions(true);
-  if (!h.exec) return renderDetailEmpty();
+  if (!h.exec) {
+    // S27: no execution in the hash means the detail is closed. Drop the
+    // selection too, or a selectExecution still in flight sees its guard pass
+    // (state.exec === its id no longer holds) and resurrects the panel.
+    state.exec = null;
+    state.node = null;
+    state.run = 0;
+    state.execData = null;
+    markSelectedExecution();
+    return renderDetailEmpty();
+  }
   if (h.exec !== state.exec) return selectExecution(h.exec, h.node, h.run);
   if (h.node && (h.node !== state.node || h.run !== state.run)) return selectNode(h.node, h.run);
 }
@@ -1060,26 +1164,47 @@ async function openSettings() {
   $("settings-save").disabled = true;
   $("cfg-retention").focus({ preventScroll: true });
   try {
-    const cfg = await api("/api/config");
-    const days = cfg.retentionDays ?? 0;
-    const sel = $("cfg-retention");
-    if ([...sel.options].some((o) => o.value === String(days))) sel.value = String(days);
-    else { sel.value = RETENTION_CUSTOM; $("cfg-retention-custom").value = days; }
-    $("cfg-retention-custom").hidden = sel.value !== RETENTION_CUSTOM;
-    const b = cfg.brand || {};
-    $("cfg-title").value = b.title || "";
-    $("cfg-subtitle").value = b.subtitle || "";
-    // S9: remember what the server has; this session starts with no logo change.
-    storedLogo = b.logo || null;
-    pendingLogo = null;
-    logoCleared = false;
-    $("cfg-logo-file").value = "";
-    showLogoPreview(storedLogo);
+    fillSettingsForm(await api("/api/config"));
   } catch (e) {
-    setSettingsMsg(`No se pudieron cargar: ${e.message}`, true);
-    return;
+    // S28: never leave the dialog inert. Fall back to the defaults the form
+    // shows when nothing is stored, say what failed, and let the user save.
+    resetSettingsForm();
+    setSettingsMsg(`No se pudieron cargar los ajustes actuales (${e.message}). Se guardará lo que escribas aquí.`, true);
+  } finally {
+    $("settings-save").disabled = false;
   }
-  $("settings-save").disabled = false;
+}
+
+// The values the server has right now, painted into the form.
+function fillSettingsForm(cfg) {
+  const days = cfg.retentionDays ?? 0;
+  const sel = $("cfg-retention");
+  if ([...sel.options].some((o) => o.value === String(days))) sel.value = String(days);
+  else { sel.value = RETENTION_CUSTOM; $("cfg-retention-custom").value = days; }
+  $("cfg-retention-custom").hidden = sel.value !== RETENTION_CUSTOM;
+  const b = cfg.brand || {};
+  $("cfg-title").value = b.title || "";
+  $("cfg-subtitle").value = b.subtitle || "";
+  // S9: remember what the server has; this session starts with no logo change.
+  storedLogo = b.logo || null;
+  pendingLogo = null;
+  logoCleared = false;
+  $("cfg-logo-file").value = "";
+  showLogoPreview(storedLogo);
+}
+
+// Empty form = the viewer's own defaults (unlimited retention, no brand).
+function resetSettingsForm() {
+  $("cfg-retention").value = "0";
+  $("cfg-retention-custom").value = "";
+  $("cfg-retention-custom").hidden = true;
+  $("cfg-title").value = "";
+  $("cfg-subtitle").value = "";
+  storedLogo = null;
+  pendingLogo = null;
+  logoCleared = false;
+  $("cfg-logo-file").value = "";
+  showLogoPreview(null);
 }
 
 function closeSettings() {

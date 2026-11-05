@@ -228,6 +228,8 @@ body.theme-dark input[type="date"] { color-scheme: dark; }
 .warn-box { background: rgba(217, 119, 6, .08); color: var(--warn); border-color: rgba(217, 119, 6, .3); }
 /* A failed "Cargar más" is appended under the rows instead of replacing them (S11). */
 .exec-error { padding: 10px 12px; }
+/* S32: the retry of a failed load sits under the message, inside the same box. */
+.error-box .retry { margin-top: 10px; padding: 6px 12px; font-size: 12.5px; }
 
 /* ---- Execution detail ---- */
 .panel.detail { overflow: hidden; }

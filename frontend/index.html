@@ -31,7 +31,7 @@
     </div>
   </div>
   <div class="header-right">
-    <div class="live"><span class="live-dot" id="live-dot"></span> <span id="live-txt">Cargando…</span></div>
+    <div class="live"><span class="live-dot" id="live-dot"></span> <span id="live-txt" aria-live="polite">Cargando…</span></div>
     <button id="sync-btn" class="btn btn-primary btn-sm" type="button" title="Ejecutar el flujo de copia de n8n e integrar la copia nueva en el histórico">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16M3 12a9 9 0 0 1 15.5-6.2L21 8M21 3v5h-5M3 21v-5h5"/></svg>
       <span id="sync-label">Actualizar ahora</span>
@@ -235,7 +235,7 @@
       <p class="set-hint">Dejar un campo vacío vuelve al valor por defecto.</p>
     </section>
     <div class="modal-foot">
-      <span id="settings-msg" class="settings-msg"></span>
+      <span id="settings-msg" class="settings-msg" aria-live="polite"></span>
       <button id="settings-save" class="btn btn-primary" type="button">Guardar</button>
     </div>
   </div>
