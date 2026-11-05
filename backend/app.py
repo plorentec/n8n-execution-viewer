@@ -31,6 +31,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 import schema
 import sync as syncmod
+import auth
 
 CONFIG = {
     "n8n_db": os.environ.get(
@@ -583,6 +584,14 @@ def _get_blob(con, execution_id):
 
 # ---------- HTTP handler ----------
 
+def _ensure_session_secret():
+    """Load the cookie-signing key once, lazily, from the directory the
+    history DB lives in (called on every auth path: sessions are minted
+    by login as well as read by gating)."""
+    if auth._SECRET is None:
+        auth.set_secret(auth.load_session_secret(CONFIG["history_db"]))
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "n8n-viewer/1.0"
     protocol_version = "HTTP/1.1"
@@ -603,6 +612,8 @@ class Handler(BaseHTTPRequestHandler):
         # the flag is per request, not per connection: a keep-alive socket
         # serves many requests
         self._headers_sent = False
+        self._resp_headers = []
+        self._body_length = 0
         super().handle_one_request()
 
     def end_headers(self):
@@ -618,6 +629,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in getattr(self, "_resp_headers", []):
+            self.send_header(name, value)
         if self.close_connection:
             # say it out loud: the client must not reuse this connection
             self.send_header("Connection", "close")
@@ -663,6 +676,84 @@ class Handler(BaseHTTPRequestHandler):
                 return
             remaining -= len(chunk)
 
+    # -- auth plumbing (T8) --
+
+    def _client_ip(self):
+        return self.client_address[0] if self.client_address else ""
+
+    def _cookie(self, name):
+        raw = self.headers.get("Cookie") or ""
+        for part in raw.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == name:
+                return v
+        return None
+
+    def _set_session_cookie(self, value):
+        """Path=/ works under a subpath mount and at a subdomain root.
+        Secure is set when the request arrived over TLS (the reverse proxy
+        sets X-Forwarded-Proto); on plain LAN http the flag would make the
+        browser drop the cookie."""
+        parts = [f"{auth.SESSION_COOKIE}={value}", "Path=/", "HttpOnly",
+                 "SameSite=Lax", f"Max-Age={auth.SESSION_TTL}"]
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            parts.append("Secure")
+        self._resp_headers.append(("Set-Cookie", "; ".join(parts)))
+
+    def _clear_session_cookie(self):
+        self._resp_headers.append((
+            "Set-Cookie",
+            f"{auth.SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"))
+
+    def _session(self):
+        """(user, session) for the request cookie, or None. Loads the HMAC
+        secret lazily so tests can point CONFIG at a fresh directory."""
+        _ensure_session_secret()
+        con = history()
+        try:
+            return auth.session_from_cookie(
+                con, self._cookie(auth.SESSION_COOKIE))
+        finally:
+            con.close()
+
+    def _require_session(self):
+        """401 unless a full session exists. A pending_totp session only
+        counts for the TOTP step itself (the contract: it is good for
+        nothing else). Returns the user row, or None after answering
+        (and after draining the request body — the caller has not read
+        it yet, and a keep-alive connection must not desync)."""
+        s = self._session()
+        if s is None or s["pending_totp"]:
+            self._drain_body(getattr(self, "_body_length", 0))
+            self._send(401, {"error": "unauthenticated"})
+            return None
+        return s
+
+    def _require_admin(self):
+        s = self._require_session()
+        if s is None:
+            return None
+        if s["role"] != "admin":
+            self._send(403, {"error": "forbidden"})
+            return None
+        return s
+
+    def _json_body(self, length, limit=MAX_DRAIN_BYTES):
+        if length > limit:
+            self._drain_body(length)
+            self._error(413, "payload too large")
+            return None
+        try:
+            raw = self.rfile.read(length) if length else b""
+            payload = json.loads(raw.decode() or "null")
+        except (ValueError, UnicodeDecodeError):
+            self._error(400, "invalid JSON")
+            return None
+        if not isinstance(payload, dict):
+            self._error(400, "expected a JSON object")
+            return None
+        return payload
+
     # -- GET routes --
 
     def do_GET(self):
@@ -676,7 +767,11 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return self._error(400, "invalid Content-Length header")
         self._drain_body(length)
+        self._body_length = 0  # GET bodies are consumed; rejects need no drain
         try:
+            if path.startswith("/api/") and not path.startswith("/api/auth/"):
+                if self._require_session() is None:
+                    return
             if path == "/api/stats":
                 return self._stats()
             if path == "/api/workflows":
@@ -696,6 +791,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"retentionDays": CONFIG["retention_days"],
                                  "brand": CONFIG.get("brand")})
                 return
+            # -- auth / users (T8) --
+            if path == "/api/auth/providers":
+                # public: the login screen needs to know whether to offer SSO
+                return self._send(200, {"oidc": bool(
+                    os.environ.get("N8N_VIEWER_OIDC_ISSUER"))})
+            if path == "/api/auth/me":
+                s = self._require_session()
+                if s is None:
+                    return
+                return self._send(200, {"user": {
+                    "name": s["username"], "role": s["role"],
+                    "totp_enabled": bool(s["totp_enabled"]),
+                }, "auth": "oidc" if s["source"] == "oidc" else "local"})
+            if path == "/api/auth/totp/setup":
+                if self._require_admin() is None:
+                    return
+                return self._totp_setup()
+            if path == "/api/users":
+                if self._require_admin() is None:
+                    return
+                return self._users_list()
             self._error(404, "not found")
         except BrokenPipeError:
             pass
@@ -724,11 +840,40 @@ class Handler(BaseHTTPRequestHandler):
         self._method_not_allowed()
 
     def do_DELETE(self):
-        self._method_not_allowed()
+        parsed = urlparse(self.path)
+        path = parsed.path
+        length = self._content_length()
+        self._body_length = length or 0
+        if length is None:
+            self.close_connection = True
+            return self._error(400, "invalid Content-Length header")
+        self._drain_body(length)
+        self._body_length = 0
+        m = re.fullmatch(r"/api/users/([^/]+)", path)
+        if m and self._require_admin() is not None:
+            return self._user_delete(unquote(m.group(1)))
+        # DELETE has no other purpose: keep the historical 405 for anything
+        # else (drained above), so old clients see the same answer as before
+        return self._error(405, "method not allowed")
+
+    def do_PATCH(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        length = self._content_length()
+        self._body_length = length or 0
+        if length is None:
+            self.close_connection = True
+            return self._error(400, "invalid Content-Length header")
+        m = re.fullmatch(r"/api/users/([^/]+)", path)
+        if m:
+            return self._user_patch(unquote(m.group(1)), length)
+        self._drain_body(length)
+        return self._error(404, "not found")
 
     def do_POST(self):
         path = urlparse(self.path).path
         length = self._content_length()
+        self._body_length = length or 0
         if length is None:
             # S3: the body boundary is unknown, so the stream cannot be
             # resynchronized: answer 400 and close.
@@ -738,6 +883,10 @@ class Handler(BaseHTTPRequestHandler):
             self._drain_body(length)  # no endpoint here reads a body
             if self.headers.get("x-viewer-action") != "sync":
                 return self._error(403, "x-viewer-action: sync header required")
+            # T8: the header is anti-CSRF, the session is identity — both
+            # must hold for a state-changing action.
+            if self._require_admin() is None:
+                return
             if not start_sync():
                 return self._error(409, "sync already running")
             return self._send(200, {"ok": True})
@@ -745,7 +894,25 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("x-viewer-action") != "config":
                 self._drain_body(length)
                 return self._error(403, "x-viewer-action: config header required")
+            if self._require_admin() is None:
+                return
             return self._save_config(length)
+        # -- auth / users (T8): /api/auth/* is the only unauthenticated POST
+        # surface; everything below needs a session (and admin where noted) --
+        if path.startswith("/api/auth/"):
+            _ensure_session_secret()
+            return self._auth_post(path, length)
+        if not self._require_session():
+            return
+        if path == "/api/users":
+            if self._require_admin() is None:
+                return
+            return self._users_create(length)
+        m = re.fullmatch(r"/api/users/([^/]+)", path)
+        if m:
+            if self._require_admin() is None:
+                return
+            return self._error(404, "not found")  # POST on a single user: none
         self._drain_body(length)
         return self._error(404, "not found")
 
@@ -775,6 +942,293 @@ class Handler(BaseHTTPRequestHandler):
                          "brand": CONFIG.get("brand")})
 
     # -- endpoint bodies --
+
+    def _auth_post(self, path, length):
+        """POST /api/auth/*: login, TOTP step, logout, bootstrap, enable/disable.
+        Unauthenticated by design (the TOTP step carries a pending session,
+        the rest creates or destroys one)."""
+        if path in ("/api/auth/login", "/api/auth/bootstrap", "/api/auth/totp",
+                    "/api/auth/totp/enable", "/api/auth/totp/disable"):
+            payload = self._json_body(length)
+            if payload is None:
+                return
+        else:
+            self._drain_body(length)
+            payload = {}
+        ip = self._client_ip()
+        if path == "/api/auth/login":
+            return self._login(payload, ip)
+        if path == "/api/auth/bootstrap":
+            return self._bootstrap(payload, ip)
+        if path == "/api/auth/totp":
+            return self._totp_verify(payload, ip)
+        if path == "/api/auth/logout":
+            s = self._session()
+            con = history()
+            try:
+                if s is not None:
+                    auth.destroy_session(
+                        con, self._cookie(auth.SESSION_COOKIE))
+                auth.prune_expired(con)
+            finally:
+                con.close()
+            self._clear_session_cookie()
+            return self._send(200, {"status": "ok"})
+        if path in ("/api/auth/totp/enable", "/api/auth/totp/disable"):
+            s = self._require_session()
+            if s is None:
+                return
+            return self._totp_toggle(path, s, payload)
+        self._error(404, "not found")
+
+    def _locked(self, con, username, ip, now=None):
+        """True (and answers 429) when the rolling window is saturated."""
+        fails = auth.fail_count(con, username, ip, now)
+        if fails < auth.LOCK_THRESHOLD:
+            return False
+        oldest = con.execute(
+            "SELECT min(ts) FROM login_attempts WHERE username=? AND ip=? AND ts>?",
+            (username, ip, auth.now_str((now or time.time())
+                                        - auth.LOCK_WINDOW))).fetchone()[0]
+        retry = max(1, int(auth.epoch_of(oldest) + auth.LOCK_WINDOW
+                           - (now or time.time()))) if oldest else 60
+        self._send(429, {"status": "locked", "retry_after": retry})
+        return True
+
+    def _login(self, payload, ip):
+        username = str(payload.get("username", ""))
+        password = str(payload.get("password", ""))
+        con = history()
+        try:
+            now = time.time()
+            if self._locked(con, username, ip, now):
+                return
+            user = con.execute("SELECT * FROM users WHERE username=?",
+                               (username,)).fetchone()
+            ok = (user is not None and not user["disabled"]
+                  and user["source"] == "local" and user["password_hash"]
+                  and auth.check_password(password, user["password_hash"]))
+            if not ok:
+                auth.record_fail(con, username, ip, now)
+                # identical shape for wrong user, wrong password and locked
+                # account state: the login screen must not leak which
+                return self._send(401, {"status": "bad"})
+            auth.clear_fails(con, username, ip)
+            auth.prune_expired(con)
+            pending = bool(user["totp_enabled"])
+            cookie = auth.mint_session(con, user["id"], ip, pending, now)
+            con.execute("UPDATE users SET last_login=? WHERE id=?",
+                        (auth.now_str(now), user["id"]))
+            con.commit()
+        finally:
+            con.close()
+        self._set_session_cookie(cookie)
+        if pending:
+            return self._send(200, {"status": "totp_required"})
+        return self._send(200, {"status": "ok",
+                                "user": {"name": user["username"],
+                                         "role": user["role"]}})
+
+    def _bootstrap(self, payload, ip):
+        """Only while the users table is empty: creates the first admin,
+        then logs in normally (session, cookie). Rate-limited like login."""
+        username = str(payload.get("username", ""))
+        password = str(payload.get("password", ""))
+        con = history()
+        try:
+            n = con.execute("SELECT count(*) FROM users").fetchone()[0]
+            if n:
+                return self._error(403, "bootstrap unavailable: users exist")
+            if not re.fullmatch(auth.USERNAME_RE, username) \
+                    or len(password) < 8:
+                return self._error(400,
+                                   "invalid username or password too short (min 8)")
+            auth.create_user(con, username, password, "admin")
+        finally:
+            con.close()
+        return self._login(payload, ip)
+
+    def _totp_verify(self, payload, ip):
+        s = self._session()
+        if s is None or not s["pending_totp"]:
+            self._drain_body(getattr(self, "_body_length", 0))
+            return self._error(401, {"error": "unauthenticated"} if s is None
+                               else {"error": "totp not pending"})
+        code = str(payload.get("code", ""))
+        con = history()
+        try:
+            now = time.time()
+            if self._locked(con, s["username"], ip, now):
+                return
+            secret = con.execute("SELECT totp_secret FROM users WHERE id=?",
+                                 (s["user_id"],)).fetchone()
+            if not secret or not auth.verify_totp(secret[0], code, now=now):
+                auth.record_fail(con, s["username"], ip, now)
+                return self._send(401, {"status": "bad"})
+            auth.clear_fails(con, s["username"], ip)
+            # rotate: the pending session dies, a full one is born
+            auth.destroy_session(con, self._cookie(auth.SESSION_COOKIE))
+            cookie = auth.mint_session(con, s["user_id"], ip, pending=False, now=now)
+            con.execute("UPDATE users SET last_login=? WHERE id=?",
+                        (auth.now_str(now), s["user_id"]))
+            con.commit()
+        finally:
+            con.close()
+        self._set_session_cookie(cookie)
+        return self._send(200, {"status": "ok",
+                                "user": {"name": s["username"],
+                                         "role": s["role"]}})
+
+    def _totp_setup(self):
+        s = self._session()
+        if s["totp_enabled"]:
+            return self._error(400, "totp already enabled")
+        secret = auth.generate_secret()
+        con = history()
+        try:
+            con.execute("UPDATE users SET pending_totp_secret=? WHERE id=?",
+                        (secret, s["user_id"]))
+            con.commit()
+        finally:
+            con.close()
+        return self._send(200, {"secret": secret,
+                                "otpauth_uri": auth.totp_uri(secret, s["username"])})
+
+    def _totp_toggle(self, path, s, payload):
+        enable = path.endswith("/enable")
+        code = str(payload.get("code", ""))
+        con = history()
+        try:
+            row = con.execute("SELECT totp_enabled, totp_secret, "
+                              "pending_totp_secret FROM users WHERE id=?",
+                              (s["user_id"],)).fetchone()
+            if enable:
+                secret = row["pending_totp_secret"]
+                valid = (not row["totp_enabled"] and secret
+                         and auth.verify_totp(secret, code))
+            else:
+                secret = row["totp_secret"]
+                valid = (row["totp_enabled"] and secret
+                         and auth.verify_totp(secret, code))
+            if not valid:
+                # a wrong TOTP code here is a failed authentication attempt,
+                # not a validation error: it counts for the lockout window
+                auth.record_fail(con, s["username"], self._client_ip())
+                con.close()
+                return self._send(401, {"status": "bad"})
+            if enable:
+                con.execute("UPDATE users SET totp_secret=?, totp_enabled=1, "
+                            "pending_totp_secret=NULL WHERE id=?",
+                            (secret, s["user_id"]))
+            else:
+                con.execute("UPDATE users SET totp_secret=NULL, totp_enabled=0 "
+                            "WHERE id=?", (s["user_id"],))
+            con.commit()
+        finally:
+            con.close()
+        return self._send(200, {"status": "ok", "totp_enabled": enable})
+
+    def _users_list(self):
+        con = history()
+        try:
+            rows = con.execute("SELECT username, role, totp_enabled, disabled, "
+                               "last_login, source FROM users ORDER BY username"
+                               ).fetchall()
+        finally:
+            con.close()
+        return self._send(200, [{
+            "name": r["username"], "role": r["role"],
+            "totp_enabled": bool(r["totp_enabled"]),
+            "disabled": bool(r["disabled"]),
+            "last_login": r["last_login"], "source": r["source"],
+        } for r in rows])
+
+    def _users_create(self, length):
+        payload = self._json_body(length)
+        if payload is None:
+            return
+        username = str(payload.get("username", ""))
+        password = str(payload.get("password", ""))
+        role = payload.get("role", "viewer")
+        if not re.fullmatch(auth.USERNAME_RE, username):
+            return self._error(400, "invalid username")
+        if len(password) < 8:
+            return self._error(400, "password too short (min 8)")
+        if role not in ("admin", "viewer"):
+            return self._error(400, "role must be admin or viewer")
+        con = history()
+        try:
+            if con.execute("SELECT 1 FROM users WHERE username=?",
+                           (username,)).fetchone():
+                return self._error(409, "username taken")
+            auth.create_user(con, username, password, role)
+        finally:
+            con.close()
+        return self._send(200, {"status": "ok", "name": username, "role": role})
+
+    def _load_target(self, con, name):
+        user = con.execute("SELECT * FROM users WHERE username=?", (name,)).fetchone()
+        if user is None:
+            self._error(404, "no such user")
+        return user
+
+    def _last_admin_guard(self, con, target, demote=False, disable=False):
+        if target["role"] == "admin" and not target["disabled"] \
+                and (demote or disable) and auth.count_active_admins(con) <= 1:
+            self._error(409, "cannot remove the last active admin")
+            return True
+        return False
+
+    def _user_patch(self, name, length):
+        payload = self._json_body(length)
+        if payload is None:
+            return
+        con = history()
+        try:
+            user = self._load_target(con, name)
+            if user is None:
+                return
+            demote = "role" in payload and payload["role"] != "admin"
+            disable = payload.get("disabled") is True
+            if self._last_admin_guard(con, user, demote=demote, disable=disable):
+                return
+            if "role" in payload:
+                if payload["role"] not in ("admin", "viewer"):
+                    return self._error(400, "role must be admin or viewer")
+                con.execute("UPDATE users SET role=? WHERE id=?",
+                            (payload["role"], user["id"]))
+            if "disabled" in payload:
+                con.execute("UPDATE users SET disabled=? WHERE id=?",
+                            (1 if payload["disabled"] else 0, user["id"]))
+            if "password" in payload:
+                if user["source"] == "oidc":
+                    return self._error(400, "oidc users have no local password")
+                if len(str(payload["password"])) < 8:
+                    return self._error(400, "password too short (min 8)")
+                con.execute("UPDATE users SET password_hash=? WHERE id=?",
+                            (auth.hash_password(str(payload["password"])),
+                             user["id"]))
+            con.commit()
+        finally:
+            con.close()
+        return self._send(200, {"status": "ok"})
+
+    def _user_delete(self, name):
+        con = history()
+        try:
+            user = self._load_target(con, name)
+            if user is None:
+                return
+            if user["source"] == "oidc":
+                return self._error(400, "oidc users are managed by the IdP")
+            if self._last_admin_guard(con, user, disable=True):
+                return
+            con.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
+            con.execute("DELETE FROM users WHERE id=?", (user["id"],))
+            con.commit()
+        finally:
+            con.close()
+        return self._send(200, {"status": "ok"})
 
     def _stats(self):
         con = history()
@@ -1022,12 +1476,31 @@ class Handler(BaseHTTPRequestHandler):
         })
 
 
+def _bootstrap_admin_from_env():
+    """T8: create the first admin from the environment on a fresh install,
+    so headless deployments (Docker) are never locked out of the wizard."""
+    password = os.environ.get("N8N_VIEWER_ADMIN_PASSWORD")
+    if not password:
+        return
+    con = history()
+    try:
+        if con.execute("SELECT count(*) FROM users").fetchone()[0]:
+            return
+        username = os.environ.get("N8N_VIEWER_ADMIN_USERNAME", "admin")
+        auth.create_user(con, username, password, "admin")
+        LOG.warning("created bootstrap admin user %r from environment",
+                    username)
+    finally:
+        con.close()
+
+
 def main():
     db_dir = os.path.dirname(CONFIG["history_db"])
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
     schema.init_history(CONFIG["history_db"])
     load_config_file()
+    _bootstrap_admin_from_env()
     set_state("running", "0")
     server = ThreadingHTTPServer((CONFIG["bind"], CONFIG["port"]), Handler)
     threading.Thread(target=sync_loop, daemon=True).start()

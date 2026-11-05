@@ -57,6 +57,42 @@ CREATE TABLE IF NOT EXISTS sync_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- T8: local accounts. source is 'local' | 'oidc'; an oidc account has no
+-- password and is managed in the identity provider (role/disabled still
+-- work here).
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT,
+    role TEXT NOT NULL DEFAULT 'viewer',
+    totp_secret TEXT,
+    pending_totp_secret TEXT,
+    totp_enabled INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT 'local',
+    disabled INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    last_login TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY,
+    token_hash TEXT UNIQUE NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    pending_totp INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    ip TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
+
+CREATE TABLE IF NOT EXISTS login_attempts (
+    id INTEGER PRIMARY KEY,
+    username TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    ts TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_user_ip ON login_attempts(username, ip);
 """
 
 

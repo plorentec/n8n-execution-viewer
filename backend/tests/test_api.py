@@ -19,14 +19,21 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app  # noqa: E402
+import auth  # noqa: E402
 import fixture  # noqa: E402
 import schema  # noqa: E402
 import sync as syncmod  # noqa: E402
 
 
+AUTH_COOKIE = None  # set by ApiTestBase.setUpClass: injected into every request
+
+
 def http(url):
+    req = urllib.request.Request(url)
+    if AUTH_COOKIE:
+        req.add_header("Cookie", f"viewer_session={AUTH_COOKIE}")
     try:
-        with urllib.request.urlopen(url, timeout=10) as res:
+        with urllib.request.urlopen(req, timeout=10) as res:
             return res.status, json.loads(res.read().decode())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode())
@@ -34,6 +41,8 @@ def http(url):
 
 def http_post(url, headers=None, data=None):
     req = urllib.request.Request(url, method="POST", headers=headers or {}, data=data)
+    if AUTH_COOKIE:
+        req.add_header("Cookie", f"viewer_session={AUTH_COOKIE}")
     try:
         with urllib.request.urlopen(req, timeout=10) as res:
             return res.status, json.loads(res.read().decode())
@@ -62,6 +71,29 @@ class ApiTestBase(unittest.TestCase):
         cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
+        # T8: the whole /api/* surface now needs a session. Bootstrap an
+        # admin once and share the cookie with every request this module
+        # makes (http/http_post read the module global), so the pre-auth
+        # tests keep exercising the same contract they always did.
+        global AUTH_COOKIE
+        con = app.history()
+        try:
+            auth.create_user(con, "testadmin", "pytest-admin-pass", "admin")
+        finally:
+            con.close()
+        parsed = urllib.parse.urlparse(cls.base)
+        conn = HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+        creds = json.dumps({"username": "testadmin",
+                            "password": "pytest-admin-pass"}).encode()
+        conn.request("POST", "/api/auth/login", body=creds,
+                     headers={"Content-Type": "application/json",
+                              "Content-Length": str(len(creds))})
+        res = conn.getresponse()
+        body = json.loads(res.read().decode())
+        setc = res.getheader("Set-Cookie")
+        conn.close()
+        assert res.status == 200 and body["status"] == "ok", (res.status, body)
+        AUTH_COOKIE = setc.split(";")[0].split("=", 1)[1]
 
     @classmethod
     def tearDownClass(cls):
@@ -321,6 +353,8 @@ class TestHttpFraming(ApiTestBase):
 
     def post(self, conn, path, body, headers=None):
         hdrs = {"Content-Length": str(len(body))}
+        if AUTH_COOKIE:
+            hdrs["Cookie"] = f"viewer_session={AUTH_COOKIE}"
         hdrs.update(headers or {})
         conn.request("POST", path, body=body, headers=hdrs)
         res = conn.getresponse()
@@ -328,7 +362,8 @@ class TestHttpFraming(ApiTestBase):
         return res.status, payload
 
     def get_on(self, conn, path):
-        conn.request("GET", path)
+        hdrs = {"Cookie": f"viewer_session={AUTH_COOKIE}"} if AUTH_COOKIE else {}
+        conn.request("GET", path, headers=hdrs)
         res = conn.getresponse()
         return res.status, json.loads(res.read().decode())
 
@@ -465,7 +500,8 @@ class TestVerbHandling(ApiTestBase):
         return c
 
     def get_on(self, conn, path):
-        conn.request("GET", path)
+        hdrs = {"Cookie": f"viewer_session={AUTH_COOKIE}"} if AUTH_COOKIE else {}
+        conn.request("GET", path, headers=hdrs)
         res = conn.getresponse()
         return res.status, json.loads(res.read().decode())
 
@@ -473,6 +509,7 @@ class TestVerbHandling(ApiTestBase):
         conn = self.conn()
         conn.putrequest("GET", "/api/stats")
         conn.putheader("Content-Length", "5")
+        conn.putheader("Cookie", f"viewer_session={AUTH_COOKIE}")
         conn.endheaders()
         conn.send(b"hello")
         res = conn.getresponse()
@@ -517,7 +554,9 @@ class TestErrorAfterHeaders(ApiTestBase):
         parsed = urllib.parse.urlparse(self.base)
         sock = socket.create_connection((parsed.hostname, parsed.port), timeout=10)
         self.addCleanup(sock.close)
-        sock.sendall(f"GET {path} HTTP/1.1\r\nHost: test\r\n\r\n".encode())
+        sock.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: test\r\n"
+            f"Cookie: viewer_session={AUTH_COOKIE}\r\n\r\n".encode())
         chunks = []
         while True:
             chunk = sock.recv(4096)
