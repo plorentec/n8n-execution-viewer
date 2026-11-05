@@ -308,6 +308,327 @@ class TestBlobCap(SyncTestBase):
         con.close()
 
 
+class TestBlobCapNullSize(SyncTestBase):
+    """S15: the cap also applies when n8n's jsonSizeBytes is NULL, and the
+    declared size is verified against the real payload in both directions.
+    """
+
+    CAP = 10_000
+
+    def big_blob(self):
+        return {"version": 1,
+                "resultData": {"runData": {"Big": [
+                    {"start": "2026-10-29T09:00:00.000Z", "source": [],
+                     "data": {"main": [[{"json": {"text": "x" * 20_000}}]]}}]}}}
+
+    def add_row(self, eid, jsize=None, raw_data=None):
+        fixture.add_execution(self.n8n_db, eid, "wfA", "success",
+                              "2026-10-29 09:00:00.000",
+                              "2026-10-29 09:00:01.000", jsize,
+                              blob=None if raw_data else self.big_blob(),
+                              raw_data=raw_data)
+
+    def assert_capped(self, eid):
+        con = self.hist()
+        row = con.execute(
+            "SELECT data_missing, parse_error FROM executions WHERE id=?",
+            (eid,)).fetchone()
+        self.assertIsNotNone(row, "the execution was not stored at all")
+        self.assertEqual(row["data_missing"], 1)
+        self.assertIn("too large", row["parse_error"])
+        self.assertIn(str(self.CAP), row["parse_error"])
+        self.assertIsNone(con.execute(
+            "SELECT data FROM executions_data WHERE execution_id=?",
+            (eid,)).fetchone())
+        self.assertEqual(con.execute(
+            "SELECT count(*) FROM fts_executions WHERE execution_id=?",
+            (str(eid),)).fetchone()[0], 0)
+        con.close()
+
+    def test_null_declared_size_is_capped_by_the_real_length(self):
+        self.add_row(111, jsize=None)
+        with self.assertLogs("n8n-viewer.sync", level="WARNING"):
+            result = syncmod.run_sync(self.n8n_db, self.hist_db,
+                                      max_blob_bytes=self.CAP)
+        self.assertEqual(result.get("oversizedBlobs"), 1)
+        self.assertEqual(result["added"], 10)  # nothing was rolled back
+        self.assert_capped(111)
+        # the small executions of the fixture are untouched
+        con = self.hist()
+        self.assertEqual(con.execute(
+            "SELECT data_missing FROM executions WHERE id=101").fetchone()[0], 0)
+        self.assertIsNotNone(con.execute(
+            "SELECT data FROM executions_data WHERE execution_id=101").fetchone())
+        con.close()
+
+    def test_null_declared_size_is_not_decoded(self):
+        # the payload is not even valid JSON: if the sync had decoded it, the
+        # reason would be a decode error instead of the size cap
+        self.add_row(111, jsize=None, raw_data="{" + "x" * 20_000)
+        with self.assertLogs("n8n-viewer.sync", level="WARNING"):
+            syncmod.run_sync(self.n8n_db, self.hist_db, max_blob_bytes=self.CAP)
+        con = self.hist()
+        reason = con.execute(
+            "SELECT parse_error FROM executions WHERE id=111").fetchone()[0]
+        con.close()
+        self.assertIn("too large", reason)
+        self.assertNotIn("cannot decode", reason)
+
+    def test_undersized_declaration_cannot_smuggle_a_huge_blob(self):
+        # n8n says 10 bytes, the real blob is ~20 KB: the serialized text is
+        # re-checked against the cap before anything is written
+        self.add_row(111, jsize=10)
+        with self.assertLogs("n8n-viewer.sync", level="WARNING"):
+            result = syncmod.run_sync(self.n8n_db, self.hist_db,
+                                      max_blob_bytes=self.CAP)
+        self.assertEqual(result.get("oversizedBlobs"), 1)
+        self.assert_capped(111)
+
+    def test_declared_and_real_size_below_the_cap_is_imported(self):
+        fixture.add_execution(self.n8n_db, 111, "wfA", "success",
+                              "2026-10-29 09:00:00.000",
+                              "2026-10-29 09:00:01.000", 20)
+        result = syncmod.run_sync(self.n8n_db, self.hist_db,
+                                  max_blob_bytes=1_000_000)
+        self.assertNotIn("oversizedBlobs", result)
+        con = self.hist()
+        self.assertEqual(con.execute(
+            "SELECT data_missing FROM executions WHERE id=111").fetchone()[0], 0)
+        self.assertIsNotNone(con.execute(
+            "SELECT data FROM executions_data WHERE execution_id=111").fetchone())
+        con.close()
+
+
+class TestPoisonRow(SyncTestBase):
+    """S16: one undecodable row degrades to parse_error, never a rollback."""
+
+    def assert_degraded_and_sync_survived(self, eid):
+        con = self.hist()
+        row = con.execute(
+            "SELECT data_missing, parse_error FROM executions WHERE id=?",
+            (eid,)).fetchone()
+        self.assertIsNotNone(row, "the poison row was not stored at all")
+        self.assertEqual(row["data_missing"], 1)
+        self.assertTrue(row["parse_error"])
+        # no run data reached the index for the poison row (only the workflow
+        # snapshot may have been stored, which indexes nothing)
+        self.assertEqual(con.execute(
+            "SELECT count(*) FROM fts_executions WHERE execution_id=?",
+            (str(eid),)).fetchone()[0], 0)
+        # nothing was rolled back: the fixture rows before it are still there
+        self.assertEqual(con.execute(
+            "SELECT count(*) FROM executions").fetchone()[0], 10)
+        self.assertIsNotNone(con.execute(
+            "SELECT data FROM executions_data WHERE execution_id=101").fetchone())
+        con.close()
+        self.assertEqual(self.state("last_id"), str(eid))
+
+    def test_flatted_resolve_empty_list_returns_none(self):
+        self.assertIsNone(syncmod.flatted_resolve([]))
+
+    def test_empty_flatted_array_degrades_to_parse_error(self):
+        # n8n's data column holding "[]": flatted_resolve([]) used to raise
+        # IndexError at input_arr[0], outside the caller's except tuple
+        fixture.add_execution(self.n8n_db, 111, "wfA", "success",
+                              "2026-10-29 09:00:00.000",
+                              "2026-10-29 09:00:01.000", 2,
+                              raw_data="[]")
+        result = syncmod.run_sync(self.n8n_db, self.hist_db)
+        self.assertEqual(result["added"], 10)
+        self.assert_degraded_and_sync_survived(111)
+
+    def test_non_object_root_degrades_to_parse_error(self):
+        # root entry is the number 1, not an execution object: _error_of and
+        # node_texts used to raise AttributeError on it
+        fixture.add_execution(self.n8n_db, 111, "wfA", "success",
+                              "2026-10-29 09:00:00.000",
+                              "2026-10-29 09:00:01.000", 2,
+                              raw_data="[1, 2]")
+        result = syncmod.run_sync(self.n8n_db, self.hist_db)
+        self.assertEqual(result["added"], 10)
+        self.assert_degraded_and_sync_survived(111)
+
+
+class TestNullColumns(SyncTestBase):
+    """S17: a row with NULL startedAt/status/workflowId is skipped, counted,
+    and never freezes the history through an IntegrityError rollback."""
+
+    def test_null_row_is_skipped_and_counted(self):
+        syncmod.run_sync(self.n8n_db, self.hist_db)
+        fixture.add_null_row(self.n8n_db, 111, blob={
+            "version": 1,
+            "resultData": {"runData": {"New": [
+                {"start": "2026-10-29T09:00:00.000Z", "source": [],
+                 "data": {"main": [[{"json": {"n": 1}}]]}}]}}})
+        with self.assertLogs("n8n-viewer.sync", level="WARNING") as logs:
+            result = syncmod.run_sync(self.n8n_db, self.hist_db)
+        # one line per sync, with the count (not one line per row)
+        messages = [r.getMessage() for r in logs.records]
+        self.assertEqual(len(messages), 1, messages)
+        self.assertIn("1 execution row(s) skipped", messages[0])
+        self.assertEqual(result.get("invalidRows"), 1)
+        self.assertEqual(result["added"], 0)
+        self.assertEqual(result["updated"], 0)
+        self.assertEqual(result["skipped"], 10)  # 9 unchanged + the skipped one
+        con = self.hist()
+        # the whole history is intact: no rollback of anything
+        self.assertEqual(con.execute(
+            "SELECT count(*) FROM executions").fetchone()[0], 9)
+        self.assertIsNone(con.execute(
+            "SELECT id FROM executions WHERE id=111").fetchone())
+        self.assertIsNotNone(con.execute(
+            "SELECT data FROM executions_data WHERE execution_id=101").fetchone())
+        con.close()
+        # the row exists in n8n, so it is not an import gap either
+        self.assertEqual(int(self.state("import_issues")), 1)
+        # and the cursor moved past it
+        self.assertEqual(self.state("last_id"), "111")
+
+    def test_null_row_on_first_sync_does_not_abort_the_backfill(self):
+        fixture.add_null_row(self.n8n_db, 111)
+        with self.assertLogs("n8n-viewer.sync", level="WARNING"):
+            result = syncmod.run_sync(self.n8n_db, self.hist_db)
+        self.assertEqual(result.get("invalidRows"), 1)
+        self.assertEqual(result["added"], 9)
+        con = self.hist()
+        self.assertEqual(con.execute(
+            "SELECT count(*) FROM executions").fetchone()[0], 9)
+        con.close()
+        self.assertEqual(self.state("last_id"), "111")
+
+    def test_valid_rows_are_unaffected(self):
+        result = syncmod.run_sync(self.n8n_db, self.hist_db)
+        self.assertNotIn("invalidRows", result)
+        self.assertEqual(result, {"added": 9, "updated": 0, "skipped": 0})
+
+
+class TestMemoryError(SyncTestBase):
+    """S22: MemoryError joins the caught set around decode/serialize/decode of
+    the workflow snapshot: it degrades to parse_error instead of killing the
+    sync process."""
+
+    def test_memoryerror_while_serializing(self):
+        fixture.add_execution(self.n8n_db, 111, "wfA", "success",
+                              "2026-10-29 09:00:00.000",
+                              "2026-10-29 09:00:01.000", 30)
+
+        def boom(*a, **k):
+            raise MemoryError("out of memory")
+
+        original = syncmod.json.dumps
+        syncmod.json.dumps = boom
+        try:
+            result = syncmod.run_sync(self.n8n_db, self.hist_db)
+        finally:
+            syncmod.json.dumps = original
+        self.assertEqual(result["added"], 10)
+        con = self.hist()
+        row = con.execute(
+            "SELECT data_missing, parse_error FROM executions WHERE id=111"
+        ).fetchone()
+        self.assertEqual(row["data_missing"], 1)
+        self.assertIn("cannot encode", row["parse_error"])
+        self.assertIsNone(con.execute(
+            "SELECT data FROM executions_data WHERE execution_id=111").fetchone())
+        con.close()
+        self.assertEqual(self.state("last_id"), "111")
+
+    def test_memoryerror_while_decoding(self):
+        fixture.add_execution(self.n8n_db, 111, "wfA", "success",
+                              "2026-10-29 09:00:00.000",
+                              "2026-10-29 09:00:01.000", 30)
+
+        def boom(*a, **k):
+            raise MemoryError("out of memory")
+
+        original = syncmod.decode_execution_data
+        syncmod.decode_execution_data = boom
+        try:
+            result = syncmod.run_sync(self.n8n_db, self.hist_db)
+        finally:
+            syncmod.decode_execution_data = original
+        self.assertEqual(result["added"], 10)
+        con = self.hist()
+        row = con.execute(
+            "SELECT data_missing, parse_error FROM executions WHERE id=111"
+        ).fetchone()
+        self.assertEqual(row["data_missing"], 1)
+        self.assertIn("cannot decode", row["parse_error"])
+        con.close()
+        self.assertEqual(self.state("last_id"), "111")
+
+
+class TestUnchangedRows(SyncTestBase):
+    """S23: a row in the rescan window whose indexed state did not change is
+    not re-read, re-serialized nor re-written (the `skipped` counter keeps
+    counting it)."""
+
+    def traced_sync(self):
+        """Run one sync counting every statement against execution_data."""
+        statements = []
+        original = syncmod.open_n8n
+
+        def traced(path):
+            con = original(path)
+            con.set_trace_callback(statements.append)
+            return con
+
+        syncmod.open_n8n = traced
+        try:
+            result = syncmod.run_sync(self.n8n_db, self.hist_db)
+        finally:
+            syncmod.open_n8n = original
+        blob_reads = [s for s in statements if "FROM execution_data" in s]
+        return result, blob_reads
+
+    def test_unchanged_rows_do_not_read_the_blob(self):
+        first, first_reads = self.traced_sync()
+        self.assertEqual(first["added"], 9)
+        self.assertEqual(len(first_reads), 9, first_reads)
+        second, second_reads = self.traced_sync()
+        self.assertEqual(second, {"added": 0, "updated": 0, "skipped": 9})
+        self.assertEqual(second_reads, [],
+                         "the sync re-read the payload of unchanged rows")
+
+    def test_changed_rows_still_read_the_blob(self):
+        self.traced_sync()
+        fixture.finish_execution(self.n8n_db, 104, "2026-10-21 10:05:00.000")
+        result, reads = self.traced_sync()
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(len(reads), 1, reads)
+
+    def test_unchanged_row_is_not_rewritten(self):
+        syncmod.run_sync(self.n8n_db, self.hist_db)
+        con = self.hist()
+        before = con.execute(
+            "SELECT imported_at, data_missing, parse_error FROM executions "
+            "WHERE id=101").fetchone()
+        fts_before = [tuple(r) for r in con.execute(
+            'SELECT node_name, text FROM fts_executions '
+            'WHERE execution_id="101"')]
+        con.close()
+        # a sentinel: n8n's payload for an unchanged row becomes undecodable,
+        # so only re-reading it could change the indexed state
+        con = sqlite3.connect(self.n8n_db)
+        con.execute("UPDATE execution_data SET data='{oops' WHERE executionId=101")
+        con.commit()
+        con.close()
+        syncmod.run_sync(self.n8n_db, self.hist_db)
+        con = self.hist()
+        after = con.execute(
+            "SELECT imported_at, data_missing, parse_error FROM executions "
+            "WHERE id=101").fetchone()
+        fts_after = [tuple(r) for r in con.execute(
+            'SELECT node_name, text FROM fts_executions '
+            'WHERE execution_id="101"')]
+        data_after = con.execute(
+            "SELECT data FROM executions_data WHERE execution_id=101").fetchone()
+        con.close()
+        self.assertEqual(tuple(after), tuple(before))
+        self.assertEqual(fts_after, fts_before)
+        self.assertIsNotNone(data_after, "the stored blob was dropped")
+
+
 class TestRobustness(SyncTestBase):
     def test_schema_change_detected(self):
         con = sqlite3.connect(self.n8n_db)

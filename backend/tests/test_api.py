@@ -424,6 +424,137 @@ class TestHttpFraming(ApiTestBase):
         self.assertEqual(code, 200)
 
 
+class TestSocketTimeout(ApiTestBase):
+    """S18: the Handler has a socket timeout, so a client that connects and
+    sends nothing cannot pin a worker thread forever, and a timed-out
+    keep-alive connection is closed by the stdlib without error noise."""
+
+    def test_handler_has_a_socket_timeout(self):
+        self.assertEqual(app.Handler.timeout, 30)
+
+    def test_idle_connection_is_closed_without_an_error_response(self):
+        import socket
+        # the value the real handler uses, scaled down so the test is quick
+        quiet = type("QuietHandler", (app.Handler,),
+                     {"timeout": app.Handler.timeout / 50})
+        from http.server import ThreadingHTTPServer
+        server = ThreadingHTTPServer(("127.0.0.1", 0), quiet)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        sock = socket.create_connection(server.server_address, timeout=5)
+        self.addCleanup(sock.close)
+        sock.settimeout(5)
+        # nothing is sent: the server must drop the connection (no bytes)
+        self.assertEqual(sock.recv(1), b"",
+                         "the idle connection was neither closed nor silent")
+        # and the server is still healthy
+        code, body = http(f"http://127.0.0.1:{server.server_address[1]}/api/stats")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["executions"], 9)
+
+
+class TestVerbHandling(ApiTestBase):
+    """S19: GET drains a stray body (HTTP/1.1 keep-alive) and the methods with
+    no handler answer 405 after draining instead of the stdlib 501."""
+
+    def conn(self):
+        parsed = urllib.parse.urlparse(self.base)
+        c = HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+        self.addCleanup(c.close)
+        return c
+
+    def get_on(self, conn, path):
+        conn.request("GET", path)
+        res = conn.getresponse()
+        return res.status, json.loads(res.read().decode())
+
+    def test_get_drains_a_stray_body(self):
+        conn = self.conn()
+        conn.putrequest("GET", "/api/stats")
+        conn.putheader("Content-Length", "5")
+        conn.endheaders()
+        conn.send(b"hello")
+        res = conn.getresponse()
+        self.assertEqual(res.status, 200)
+        self.assertEqual(json.loads(res.read().decode())["executions"], 9)
+        # the unread body used to be parsed as the next request line
+        code, body = self.get_on(conn, "/api/config")
+        self.assertEqual(code, 200, "the GET body desynchronized the connection")
+        self.assertIn("retentionDays", body)
+
+    def test_get_with_a_bogus_content_length_is_rejected(self):
+        # S3/S19: the body boundary is unknown, so a GET cannot be
+        # resynchronized either: answer 400 and close, never read(-1)
+        conn = self.conn()
+        conn.putrequest("GET", "/api/stats")
+        conn.putheader("Content-Length", "-5")
+        conn.endheaders()
+        res = conn.getresponse()
+        self.assertEqual(res.status, 400)
+        self.assertIn("Content-Length", json.loads(res.read().decode())["error"])
+        self.assertEqual(res.getheader("Connection"), "close")
+
+    def test_put_and_delete_answer_405_after_draining(self):
+        for method in ("PUT", "DELETE"):
+            conn = self.conn()
+            conn.request(method, "/api/config", body=b'{"retentionDays": 5}')
+            res = conn.getresponse()
+            payload = json.loads(res.read().decode())
+            self.assertEqual(res.status, 405, f"{method} should not be a 501")
+            self.assertIn("error", payload)
+            code, _ = self.get_on(conn, "/api/config")
+            self.assertEqual(code, 200,
+                             f"the {method} body desynchronized the connection")
+
+
+class TestErrorAfterHeaders(ApiTestBase):
+    """S20: a failure after the response headers went out must close the
+    connection instead of writing a second status line on the same stream."""
+
+    def raw_get(self, path):
+        import socket
+        parsed = urllib.parse.urlparse(self.base)
+        sock = socket.create_connection((parsed.hostname, parsed.port), timeout=10)
+        self.addCleanup(sock.close)
+        sock.sendall(f"GET {path} HTTP/1.1\r\nHost: test\r\n\r\n".encode())
+        chunks = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+
+    def test_failure_after_the_headers_closes_the_connection(self):
+        def half_send(handler):
+            handler._send(200, [])  # status line + headers + body are out
+            raise RuntimeError("late failure")
+
+        original = app.Handler._workflows
+        app.Handler._workflows = half_send
+        try:
+            raw = self.raw_get("/api/workflows")
+        finally:
+            app.Handler._workflows = original
+        self.assertTrue(raw.startswith(b"HTTP/1.1 200"), raw)
+        self.assertEqual(raw.count(b"HTTP/1.1 "), 1,
+                         f"a second status line was written: {raw!r}")
+        self.assertNotIn(b"500", raw)
+
+    def test_failure_before_the_headers_still_answers_500(self):
+        def boom(handler):
+            raise RuntimeError("early failure")
+
+        original = app.Handler._stats
+        app.Handler._stats = boom
+        try:
+            code, body = self.get("/api/stats")
+        finally:
+            app.Handler._stats = original
+        self.assertEqual(code, 500)
+        self.assertIn("early failure", body["error"])
+
+
 class TestStatsStorage(ApiTestBase):
     """S7: /api/stats exposes the storage block (current + estimated disk use)."""
 
@@ -728,6 +859,8 @@ class TestRetentionReclaimsSpace(RetentionSpaceBase):
         con.close()
         before = self.metrics()
         self.assertGreater(before["freelist"], 0)
+        # below the S21 threshold a quiet pass stays completely free
+        self.assertLess(before["freelist"], app.RECLAIM_NOOP_FREELIST_PAGES)
 
         self.assertEqual(app.apply_retention(), 0)
 
@@ -736,6 +869,29 @@ class TestRetentionReclaimsSpace(RetentionSpaceBase):
                          "a no-op retention pass ran a compaction")
         self.assertEqual(after["page_count"], before["page_count"])
         self.assertEqual(after["fts_bytes"], before["fts_bytes"])
+
+    def test_failed_reclaim_is_retried_by_a_noop_pass(self):
+        # S21: a reclaim whose incremental_vacuum/checkpoint failed is only
+        # logged, so its free pages stay trapped inside the file. The next
+        # pass that deletes nothing has to retry it once the freelist is over
+        # the documented threshold.
+        self.make_history()
+        self.seed(old=0, new=120)
+        con = sqlite3.connect(self.hist_db)
+        con.execute("DELETE FROM executions_data WHERE execution_id < 1080")
+        con.execute("DELETE FROM executions WHERE id < 1080")
+        con.commit()
+        con.close()
+        before = self.metrics()
+        self.assertGreater(before["freelist"], app.RECLAIM_NOOP_FREELIST_PAGES)
+        self.assertEqual(app.apply_retention(), 0)  # nothing is expired
+        after = self.metrics()
+        self.assertEqual(after["executions"], before["executions"])
+        self.assertEqual(after["freelist"], 0,
+                         "the trapped free pages of a failed reclaim were "
+                         "not retried")
+        self.assertLess(after["page_count"], before["page_count"])
+        self.assertLess(after["size"], before["size"])
 
     def test_legacy_database_is_converted_and_compacted(self):
         # a history created by an older version has auto_vacuum=NONE: its free

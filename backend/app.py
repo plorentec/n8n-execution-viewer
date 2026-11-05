@@ -78,6 +78,13 @@ LOG = logging.getLogger("n8n-viewer")
 INCREMENTAL_VACUUM_PAGES = 200    # pages per pragma call (SQLite frees >= 1)
 RECLAIM_MAX_PAGES = 500_000       # hard cap per pass (~2 GB at 4 KiB pages)
 RECLAIM_BUDGET_S = 5.0            # wall-clock cap per pass
+# S21: a reclaim that failed (incremental_vacuum/checkpoint error, or a legacy
+# VACUUM that never got to run) is only logged, so its free pages stay trapped
+# inside the file. The next pass retries the reclaim even when it deletes
+# nothing, but only once the freelist is worth the sync thread's time: this
+# many free pages (~4 MB at the default 4 KiB page size) is the documented
+# threshold below which a quiet pass still touches nothing at all.
+RECLAIM_NOOP_FREELIST_PAGES = 1000
 LEGACY_VACUUM_MIN_BYTES = 8 << 20  # rewrite a legacy file only for >= 8 MB
 LEGACY_VACUUM_DISK_FACTOR = 2.2    # VACUUM needs room for a second copy
 
@@ -299,8 +306,9 @@ def _legacy_vacuum(con):
 def _reclaim_history_space(con):
     """S6: give back what a retention delete freed.
 
-    Called only by apply_retention() (sync thread, sync lock held) and only
-    when that pass deleted rows: a no-op pass never touches the file.
+    Called only by apply_retention() (sync thread, sync lock held): after a
+    pass that deleted rows, or after a no-op pass whose freelist is over
+    RECLAIM_NOOP_FREELIST_PAGES (S21: retry a reclaim that failed earlier).
     """
     # 1) merge the FTS5 segments: deleting rows only marks their entries as
     #    gone, the text stays inside the on-disk segments until they merge.
@@ -329,7 +337,9 @@ def apply_retention(cutoff=None):
     has no foreign keys and the per-connection foreign_keys pragma is not
     guaranteed), so the deletions are deterministic regardless of pragma
     state. When rows were deleted the freed disk space is reclaimed
-    (_reclaim_history_space); a pass that deletes nothing does no work.
+    (_reclaim_history_space); a pass that deletes nothing leaves the file
+    alone unless its freelist is over RECLAIM_NOOP_FREELIST_PAGES, in which
+    case the reclaim is retried (S21).
 
     `cutoff` is the boundary sync.run_sync used to skip expired rows (S7);
     when omitted it is derived from the configured retention days.
@@ -345,32 +355,40 @@ def apply_retention(cutoff=None):
     try:
         ids = [r[0] for r in con.execute(
             "SELECT id FROM executions WHERE started_at < ?", (cutoff,))]
-        if not ids:
-            return 0
-        con.execute("BEGIN IMMEDIATE")
-        try:
-            for i in range(0, len(ids), 500):
-                chunk = ids[i:i + 500]
-                marks = ",".join("?" * len(chunk))
-                # S4: this index stores execution_id as TEXT (fts5 columns have
-                # no type affinity), so it must be matched with TEXT too;
-                # integers would never match and the cleanup would be a no-op.
-                con.execute(
-                    f"DELETE FROM fts_executions WHERE execution_id IN ({marks})",
-                    [str(i) for i in chunk])
-                con.execute(
-                    f"DELETE FROM executions_data WHERE execution_id IN ({marks})",
-                    chunk)
-                con.execute(
-                    f"DELETE FROM executions WHERE id IN ({marks})", chunk)
-            con.execute("COMMIT")
-        except BaseException:
+        if ids:
+            con.execute("BEGIN IMMEDIATE")
             try:
-                con.execute("ROLLBACK")
-            except sqlite3.Error:
-                pass  # sqlite3 may have rolled back on its own already
-            raise
-        # only past this point: the rows are really gone
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    marks = ",".join("?" * len(chunk))
+                    # S4: this index stores execution_id as TEXT (fts5 columns have
+                    # no type affinity), so it must be matched with TEXT too;
+                    # integers would never match and the cleanup would be a no-op.
+                    con.execute(
+                        f"DELETE FROM fts_executions WHERE execution_id IN ({marks})",
+                        [str(i) for i in chunk])
+                    con.execute(
+                        f"DELETE FROM executions_data WHERE execution_id IN ({marks})",
+                        chunk)
+                    con.execute(
+                        f"DELETE FROM executions WHERE id IN ({marks})", chunk)
+                con.execute("COMMIT")
+            except BaseException:
+                try:
+                    con.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass  # sqlite3 may have rolled back on its own already
+                raise
+        else:
+            # S21: nothing to delete, but a reclaim that failed on an earlier
+            # pass (its exception is only logged) left its free pages trapped
+            # inside the file, and nothing else would ever retry it. Retry it
+            # here once the freelist is over the documented threshold; below
+            # it a quiet pass stays completely free.
+            if (con.execute("PRAGMA freelist_count").fetchone()[0]
+                    < RECLAIM_NOOP_FREELIST_PAGES):
+                return 0
+        # rows really gone (or a reclaim to retry): compact now
         try:
             _reclaim_history_space(con)
         except sqlite3.Error as e:
@@ -568,9 +586,31 @@ def _get_blob(con, execution_id):
 class Handler(BaseHTTPRequestHandler):
     server_version = "n8n-viewer/1.0"
     protocol_version = "HTTP/1.1"
+    # S18: per-connection socket timeout. Without it a client that opens the
+    # connection and sends nothing (or a half-written request head) pins a
+    # worker thread for the life of the process. The stdlib turns an expired
+    # timeout into a closed connection (handle_one_request catches
+    # TimeoutError and sets close_connection), and log_message below keeps it
+    # quiet, so an idle keep-alive socket costs nothing.
+    timeout = 30
+    # S20: set once the status line is on the wire (see end_headers).
+    _headers_sent = False
 
     def log_message(self, fmt, *args):  # keep stdout quiet; journal if needed
         pass
+
+    def handle_one_request(self):
+        # the flag is per request, not per connection: a keep-alive socket
+        # serves many requests
+        self._headers_sent = False
+        super().handle_one_request()
+
+    def end_headers(self):
+        # S20: past this point the response has started and a second status
+        # line on the same stream would corrupt it, so the error path closes
+        # the connection instead of answering again.
+        self._headers_sent = True
+        super().end_headers()
 
     def _send(self, code, payload):
         body = json.dumps(payload).encode()
@@ -628,6 +668,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        # S19: HTTP/1.1 is keep-alive, so a stray request body (a buggy client
+        # sending Content-Length on a GET) must be consumed here or it is
+        # parsed as the next request line.
+        length = self._content_length()
+        if length is None:
+            self.close_connection = True
+            return self._error(400, "invalid Content-Length header")
+        self._drain_body(length)
         try:
             if path == "/api/stats":
                 return self._stats()
@@ -652,7 +700,31 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
         except Exception as e:
+            if self._headers_sent:
+                # S20: the status line (and possibly part of the body) is
+                # already out, so answering 500 here would append a second
+                # response to the same stream. Close instead: the client sees
+                # a truncated response on this connection only.
+                self.close_connection = True
+                return
             self._error(500, f"{type(e).__name__}: {e}")
+
+    def _method_not_allowed(self):
+        """S19: PUT/DELETE have no handler. The stdlib would answer a bare 501
+        without consuming the request body, leaving the keep-alive stream
+        desynchronized; drain first, then answer 405."""
+        length = self._content_length()
+        if length is None:
+            self.close_connection = True
+            return self._error(400, "invalid Content-Length header")
+        self._drain_body(length)
+        return self._error(405, "method not allowed")
+
+    def do_PUT(self):
+        self._method_not_allowed()
+
+    def do_DELETE(self):
+        self._method_not_allowed()
 
     def do_POST(self):
         path = urlparse(self.path).path

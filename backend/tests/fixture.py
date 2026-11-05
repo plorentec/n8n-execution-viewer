@@ -350,13 +350,18 @@ def create_n8n_db(path):
 
 
 def add_execution(path, eid, workflow, status, started, stopped=None, jsize=None,
-                  blob=None, wf=None):
+                  blob=None, wf=None, raw_data=None):
     """Append a new execution (used to test incremental sync).
 
     blob/wf override the default payload, so a test can store a shape the
     builders above do not produce (e.g. a self-referencing structure, which
     flatted_strify encodes faithfully and flatted_resolve revives as a cycle).
+    raw_data is written verbatim into execution_data.data, for the payloads a
+    well-formed flatted encoder would never produce (an empty array, an
+    undecodable blob).
     """
+    if raw_data is not None and blob is not None:
+        raise ValueError("pass either blob or raw_data, not both")
     con = sqlite3.connect(path)
     con.execute(
         "INSERT INTO execution_entity(id, workflowId, status, stoppedAt, mode, "
@@ -378,10 +383,43 @@ def add_execution(path, eid, workflow, status, started, stopped=None, jsize=None
         wf = {"nodes": [{"name": "New", "type": "n8n-nodes-base.manualTrigger",
                          "position": [0, 0], "parameters": {}}],
               "connections": {"New": {"main": []}}}
+    data_text = (raw_data if raw_data is not None
+                 else json.dumps(flatted_strify(blob), ensure_ascii=False))
     con.execute("INSERT INTO execution_data(executionId, data, workflowData) "
                 "VALUES(?,?,?)",
-                (eid, json.dumps(flatted_strify(blob), ensure_ascii=False),
-                 json.dumps(wf, ensure_ascii=False)))
+                (eid, data_text, json.dumps(wf, ensure_ascii=False)))
+    con.commit()
+    con.close()
+
+
+def add_null_row(path, eid, blob=None):
+    """Append an execution_entity row with NULL startedAt/status/workflowId.
+
+    n8n writes startedAt when the execution actually starts, so a row can be
+    read while those columns are still NULL. Used to test the S17 guard: such
+    a row must never hit the history's NOT NULL columns.
+    """
+    con = sqlite3.connect(path)
+    con.execute(
+        "INSERT INTO execution_entity(id, workflowId, status, stoppedAt, mode, "
+        "deletedAt, startedAt, jsonSizeBytes) VALUES(?,?,?,?,?,?,?,?)",
+        (eid, None, None, None, "manual", None, None, None))
+    con.commit()
+    con.close()
+    if blob is not None:
+        add_execution_data(path, eid, blob)
+
+
+def add_execution_data(path, eid, blob=None, wf=None, raw_data=None):
+    """Attach/replace the execution_data row of an existing execution."""
+    con = sqlite3.connect(path)
+    data_text = (raw_data if raw_data is not None
+                 else json.dumps(flatted_strify(blob), ensure_ascii=False))
+    con.execute("INSERT INTO execution_data(executionId, data, workflowData) "
+                "VALUES(?,?,?) ON CONFLICT(executionId) DO UPDATE SET "
+                "data=excluded.data, workflowData=excluded.workflowData",
+                (eid, data_text,
+                 json.dumps(wf, ensure_ascii=False) if wf is not None else None))
     con.commit()
     con.close()
 
