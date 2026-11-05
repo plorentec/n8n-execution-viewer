@@ -504,3 +504,30 @@ footer b { color: var(--primary); }
 .user-new { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 .user-new input, .user-new select { flex: 1 1 120px; min-width: 0; }
 .settings-msg.is-error { color: #b3261e; font-weight: 600; }
+
+/* ---------- settings page (same design system as the app) ---------- */
+
+.page { max-width: 860px; margin: 0 auto; padding: 26px 20px 80px; }
+.page h2 { font-size: 17px; font-weight: 800; margin: 26px 0 8px; padding-top: 20px;
+  border-top: 1px solid var(--border); }
+.page section:first-of-type h2 { border-top: 0; padding-top: 0; margin-top: 6px; }
+.page .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+  padding: 16px 18px; box-shadow: var(--shadow); }
+.page .lbl { display: block; font-size: 12px; font-weight: 700; letter-spacing: .3px;
+  text-transform: uppercase; color: var(--text-2); margin: 12px 0 4px; }
+.page input, .page select { width: 100%; max-width: 420px; background: var(--bg-2);
+  color: var(--text); border: 1px solid var(--border); border-radius: 9px;
+  padding: 9px 12px; font: inherit; }
+.page input:focus, .page select:focus { outline: none; border-color: var(--accent); }
+.page .hint { color: var(--text-2); font-size: 13px; margin: 6px 0 0; }
+.page .actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+.page .msg.is-error, .page .hint.is-error { color: var(--fail); font-weight: 600; }
+.logo-preview { width: 44px; height: 44px; border-radius: 10px; display: block; margin-top: 8px; }
+.page .totp-input { letter-spacing: 8px; font-size: 20px; text-align: center; width: 150px;
+  font-family: var(--mono); }
+.page .totp-qr { width: 180px; height: 180px; border-radius: 8px; display: block; margin: 6px 0;
+  background: #fff; }
+.page .totp-secret { display: block; word-break: break-all; background: var(--sunken);
+  border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; margin: 6px 0;
+  font-size: 13px; user-select: all; font-family: var(--mono); }
+.hidden { display: none !important; }

@@ -36,6 +36,8 @@ const fakeEl = (tag) => {
 };
 const byId = {};
 globalThis.document = {
+  body: fakeEl("body"),
+  head: fakeEl("head"),
   createElement: fakeEl,
   createElementNS: (ns, tag) => fakeEl(tag),
   createTextNode: (t) => ({ text: t, __text: true }),
@@ -82,6 +84,7 @@ await import("/home/orca/orca/projects/n8n-viewer/frontend/settings.js");
 await new Promise(r => setTimeout(r, 1200));
 
 // ---- assertions -------------------------------------------------------------
+assert.equal(byId["brand-title"].textContent, "PRUEBA", "marca pintada en el header");
 assert.equal(byId["cfg-retention"].value, "30", "retención cargada del backend");
 assert.equal(byId["cfg-title"].value, "PRUEBA", "marca cargada del backend");
 const allText = [];

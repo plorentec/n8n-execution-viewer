@@ -82,7 +82,33 @@ async function gate() {
 
 // ---------------------------------------------------------------- retention + brand
 
+function paintBrand(brand) {
+  if (!brand) return;
+  const title = $("brand-title"), sub = $("brand-sub");
+  if (brand.title && title) title.textContent = brand.title;
+  if (brand.subtitle && sub) sub.textContent = brand.subtitle;
+  if (brand.logo) {
+    const svg = document.getElementById("brand-logo");
+    if (svg) {
+      const img = document.createElement("img");
+      img.className = "logo";
+      img.src = brand.logo;
+      img.alt = "";
+      svg.replaceWith(img);
+    }
+  }
+  if (brand.favicon) {
+    let link = document.querySelector('link[rel="icon"]');
+    if (!link) { link = document.createElement("link"); link.rel = "icon"; document.head.appendChild(link); }
+    link.href = brand.favicon;
+  }
+  if (brand.title || brand.subtitle) {
+    document.title = ["Ajustes", brand.title].filter(Boolean).join(" · ");
+  }
+}
+
 function fillForm(cfg) {
+  paintBrand(cfg.brand);
   const sel = $("cfg-retention");
   const days = cfg.retentionDays ?? 0;
   const known = ["0", "30", "90", "180", "365", "730"];
@@ -302,6 +328,10 @@ function backToLogin() {
 }
 
 function wire() {
+  $("theme-toggle").addEventListener("click", () => {
+    const dark = document.body.classList.toggle("theme-dark");
+    try { localStorage.setItem("n8nViewerTheme", dark ? "dark" : "light"); } catch { /* optional */ }
+  });
   $("settings-save").addEventListener("click", save);
   $("cfg-retention").addEventListener("change", (e) => {
     $("cfg-retention-custom").classList.toggle("hidden", e.target.value !== RETENTION_CUSTOM);
