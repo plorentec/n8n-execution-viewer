@@ -268,6 +268,12 @@ Open `https://your-host/n8n-viewer/`.
 | `N8N_VIEWER_PORT` | `8391` | API port |
 | `N8N_VIEWER_SYNC_INTERVAL` | `300` | seconds between automatic syncs |
 | `N8N_VIEWER_PAGE_SIZE` | `50` | executions per page |
+| `N8N_VIEWER_ADMIN_PASSWORD` | — | create the first admin at startup on a fresh install (username: `admin`, override with `N8N_VIEWER_ADMIN_USERNAME`). Without it, the UI offers a one-time first-run wizard instead |
+| `N8N_VIEWER_OIDC_ISSUER` | — | enable Keycloak/OIDC sign-in, e.g. `https://keycloak.example.com/realms/myrealm` |
+| `N8N_VIEWER_OIDC_CLIENT_ID` | — | confidential client id |
+| `N8N_VIEWER_OIDC_CLIENT_SECRET` | — | confidential client secret |
+| `N8N_VIEWER_OIDC_ADMIN_GROUP` | — | users whose IdP groups claim contains this get the admin role |
+| `N8N_VIEWER_PUBLIC_BASE_URL` | — | the viewer's own base URL, used to build the OIDC redirect (`<base>/api/auth/oidc/callback`) |
 | `N8N_VIEWER_RETENTION_DAYS` | `0` | keep the history this many days; `0` = keep forever. After each sync, older rows are dropped from the history (never from n8n's own database). Also `--retention-days N` in `install.sh` |
 | `N8N_VIEWER_MAX_BLOB_MB` | `50` | skip the payload of any execution whose stored data is larger than this. The execution still appears in the list, marked as having no data, instead of being loaded and re-serialized in memory |
 
@@ -388,6 +394,33 @@ python3 -m unittest discover -s tests -v
 - The history database grows (~a few hundred MB per day on a busy
   instance); it is a plain SQLite file you can delete/rotate at will.
 
+## Users, roles, 2FA and Keycloak
+
+Everything behind `/api/*` requires a session; the static files (login
+screen included) stay public. Two roles:
+
+- **admin** — settings, retention, branding, user management, manual sync
+- **viewer** — browse the history only
+
+Local accounts live in the viewer's own database; passwords are stored
+with PBKDF2-SHA256 (600k iterations). Sessions are signed HttpOnly
+cookies that survive restarts. Login is rate-limited per user+IP (5
+failures in 15 minutes → lockout) and never reveals whether the account
+exists. Admins can require a **TOTP second factor** (Settings → Mi 2FA;
+QR or manual secret into any authenticator app).
+
+**First run:** open the UI — a one-time "Configurar por primera vez"
+wizard creates the first admin (only offered while no users exist), or
+set `N8N_VIEWER_ADMIN_PASSWORD` before starting.
+
+**Keycloak / any OIDC provider:** create a confidential client with a
+valid redirect URI `<public-base-url>/api/auth/oidc/callback`, set the
+five `N8N_VIEWER_OIDC_*` variables and restart. "Entrar con Keycloak"
+appears on the login screen; roles come from the group claim. The token
+exchange is server-to-server and identity is read from the userinfo
+endpoint, so the backend stays dependency-free. Local accounts keep
+working as a fallback when the IdP is down.
+
 ## Security notes
 
 - The backend opens n8n's database **read-only** (`file:...?mode=ro`) and
@@ -396,4 +429,6 @@ python3 -m unittest discover -s tests -v
 - The API is loopback-only by default. If you expose it, keep it behind a
   reverse proxy that restricts access (the notes in `deploy/` show the
   minimal Apache changes on a LAN/Tailscale-only host).
-- No credentials are needed or stored anywhere.
+- No credentials are needed or stored anywhere for reading n8n: the
+  database file is opened read-only at the filesystem level. The viewer's
+  own users are separate (see the section above).

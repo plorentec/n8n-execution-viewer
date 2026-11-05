@@ -85,7 +85,8 @@
     <li><a href="#config">8. Configuración (variables de entorno)</a></li>
     <li><a href="#actualizar">9. Actualizar sin perder el histórico</a></li>
     <li><a href="#backup">10. Copias de seguridad</a></li>
-    <li><a href="#faq">11. Problemas frecuentes</a></li>
+    <li><a href="#seguridad">11. Usuarios, 2FA y Keycloak</a></li>
+    <li><a href="#faq">12. Problemas frecuentes</a></li>
   </ul>
 
   <h2 id="como-funciona">1 · Cómo accede a la base de datos</h2>
@@ -294,7 +295,45 @@ ProxyPass /n8n-viewer !
   desde el repo. Un <code>sqlite3 history.db ".backup copia.db"</code> desde cron semanal es
   suficiente; hacer backup del volumen de n8n <b>no</b> es necesario para este servicio.</p>
 
-  <h2 id="faq">11 · Problemas frecuentes</h2>
+  <h2 id="seguridad">11 · Usuarios, 2FA y Keycloak</h2>
+  <p>Todo el API exige sesión: sin login no se ve ninguna ejecución. Hay dos roles:</p>
+  <table>
+    <tr><th>Rol</th><th>Puede</th></tr>
+    <tr><td><b>Admin</b></td><td>Ajustes, retención, marca, gestión de usuarios, forzar sincronización, activar su 2FA.</td></tr>
+    <tr><td><b>Viewer</b></td><td>Navegar el histórico (lista, búsqueda, diagrama, descargar JSON).</td></tr>
+  </table>
+  <h3>Primer arranque</h3>
+  <p>Al abrir la UI sin usuarios, aparece <b>"Configurar por primera vez"</b>: crea el admin
+  (usuario + contraseña) y listo. Solo se ofrece mientras no exista ninguna cuenta. En
+  despliegues automatizados puedes crearlo con la variable
+  <code>N8N_VIEWER_ADMIN_PASSWORD</code> antes de arrancar.</p>
+  <h3>2FA (TOTP)</h3>
+  <p>Cada admin puede activarse su segundo factor desde <b>Ajustes → Mi 2FA</b>: aparece un QR
+  (o la clave manual) para Google Authenticator, Aegis, etc. A partir de ahí, el login pide el
+  código de 6 dígitos. Desactivarlo exige un código válido.</p>
+  <h3>Keycloak (o cualquier OIDC)</h3>
+  <ol>
+    <li>En tu realm de Keycloak: <b>Clients → Create</b>, tipo <i>confidential</i>, con
+    <i>Valid redirect URIs</i> = <code>https://tu-visor/api/auth/oidc/callback</code>.</li>
+    <li>Copia el <b>Client ID</b> y el <b>secret</b> (pestaña Credentials).</li>
+    <li>Añade al contenedor del viewer:</li>
+  </ol>
+  <pre>  -e N8N_VIEWER_OIDC_ISSUER=https://keycloak.tuempresa.com/realms/mi-realm \
+  -e N8N_VIEWER_OIDC_CLIENT_ID=n8n-viewer \
+  -e N8N_VIEWER_OIDC_CLIENT_SECRET=xxxx \
+  -e N8N_VIEWER_PUBLIC_BASE_URL=https://tu-visor \
+  -e N8N_VIEWER_OIDC_ADMIN_GROUP=viewers-admin</pre>
+  <p>El botón <b>"Entrar con Keycloak"</b> aparece solo en la pantalla de login. El rol admin
+  se otorga a quien pertenezca al grupo configurado. Las cuentas locales siguen funcionando
+  como respaldo si el IdP cae. El intercambio de tokens es servidor→Keycloak (backchannel) y
+  la identidad se valida con el endpoint <code>userinfo</code>: el backend no necesita
+  librerías externas.</p>
+  <div class="note"><b>No lo olvides:</b> la restricción de red (LAN/VPN en el proxy) sigue
+  siendo la primera barrera; el login es la segunda. Con Keycloak el "olvidé mi contraseña"
+  lo resuelve el propio IdP; con cuentas locales, otro admin te la restablece en
+  Ajustes → Usuarios.</div>
+
+  <h2 id="faq">12 · Problemas frecuentes</h2>
   <h3>El viewer no abre la base de datos: permission denied</h3>
   <p>El volumen de n8n pertenece a uid 1000 con ficheros <code>0600</code>. La imagen corre
   como root precisamente para poder leerlo (montada <code>:ro</code>, el root del contenedor
