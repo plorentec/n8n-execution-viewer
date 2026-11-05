@@ -17,16 +17,20 @@ Environment:
                            bigger blobs are not copied, the execution is
                            stored as data_missing with a parse_error reason
 """
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.parse
 from urllib.parse import urlparse, parse_qs, unquote
 
 import schema
@@ -804,6 +808,10 @@ class Handler(BaseHTTPRequestHandler):
                     "name": s["username"], "role": s["role"],
                     "totp_enabled": bool(s["totp_enabled"]),
                 }, "auth": "oidc" if s["source"] == "oidc" else "local"})
+            if path == "/api/auth/oidc/start":
+                return self._oidc_start()
+            if path == "/api/auth/oidc/callback":
+                return self._oidc_callback(parse_qs(parsed.query))
             if path == "/api/auth/totp/setup":
                 if self._require_admin() is None:
                     return
@@ -942,6 +950,108 @@ class Handler(BaseHTTPRequestHandler):
                          "brand": CONFIG.get("brand")})
 
     # -- endpoint bodies --
+
+    def _redirect(self, location):
+        body = b""
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        for name, value in getattr(self, "_resp_headers", []):
+            self.send_header(name, value)
+        self.end_headers()
+
+    def _oidc_start(self):
+        _ensure_session_secret()
+        if not auth.oidc_enabled():
+            return self._error(404, "oidc_disabled")
+        try:
+            doc = auth.oidc_discovery(os.environ["N8N_VIEWER_OIDC_ISSUER"])
+        except Exception:
+            return self._error(502, "identity provider unreachable")
+        verifier = secrets.token_urlsafe(48)
+        challenge = auth._b64url(hashlib.sha256(verifier.encode()).digest())
+        state = secrets.token_urlsafe(32)
+        nonce = secrets.token_urlsafe(16)
+        base = os.environ.get("N8N_VIEWER_PUBLIC_BASE_URL", "").rstrip("/")
+        redirect_uri = base + "/api/auth/oidc/callback"
+        bundle = {"state": state, "verifier": verifier, "nonce": nonce,
+                  "redirect_uri": redirect_uri}
+        qs = urllib.parse.urlencode({
+            "response_type": "code", "client_id":
+                os.environ["N8N_VIEWER_OIDC_CLIENT_ID"],
+            "redirect_uri": redirect_uri, "scope": "openid profile email",
+            "state": state, "nonce": nonce, "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        })
+        self._resp_headers.append((
+            "Set-Cookie",
+            f"viewer_oidc_state={auth.oidc_pack_state(bundle)}; Path=/; "
+            f"HttpOnly; SameSite=Lax; Max-Age={auth.OIDC_STATE_TTL}"))
+        return self._redirect(f"{doc['authorization_endpoint']}?{qs}")
+
+    def _oidc_callback(self, qs):
+        _ensure_session_secret()
+        if not auth.oidc_enabled():
+            return self._error(404, "oidc_disabled")
+        bundle = auth.oidc_unpack_state(self._cookie("viewer_oidc_state"))
+        code = (qs.get("code") or [""])[0]
+        state = (qs.get("state") or [""])[0]
+        if bundle is None or not code \
+                or not hmac.compare_digest(state, bundle["state"]):
+            return self._redirect("/?login_error=state")
+        try:
+            doc = auth.oidc_discovery(os.environ["N8N_VIEWER_OIDC_ISSUER"])
+            tokens = auth.oidc_exchange(
+                doc["token_endpoint"], code, bundle["verifier"],
+                bundle["redirect_uri"],
+                os.environ["N8N_VIEWER_OIDC_CLIENT_ID"],
+                os.environ["N8N_VIEWER_OIDC_CLIENT_SECRET"])
+            userinfo = auth.oidc_userinfo(doc["userinfo_endpoint"],
+                                          tokens.get("access_token", ""))
+        except Exception:
+            return self._error(502, "identity provider exchange failed")
+        claims = auth.oidc_id_token_claims(tokens.get("id_token", ""))
+        if claims.get("nonce") != bundle["nonce"]:
+            return self._redirect("/?login_error=nonce")
+        username = (userinfo.get("preferred_username")
+                    or userinfo.get("email") or "").strip()
+        if not username:
+            return self._redirect("/?login_error=no_identity")
+        groups = userinfo.get("groups") or []
+        admin_group = os.environ.get("N8N_VIEWER_OIDC_ADMIN_GROUP")
+        role = "admin" if admin_group and admin_group in groups else "viewer"
+        con = history()
+        try:
+            user = con.execute("SELECT * FROM users WHERE username=?",
+                               (username,)).fetchone()
+            if user is None:
+                con.execute(
+                    "INSERT INTO users (username, role, source, created_at) "
+                    "VALUES (?,?,?,?)",
+                    (username, role, "oidc", auth.now_str()))
+                user = con.execute("SELECT * FROM users WHERE username=?",
+                                   (username,)).fetchone()
+            elif user["source"] != "oidc":
+                # a local account already owns this name: refuse instead of
+                # silently merging identities
+                con.close()
+                return self._redirect("/?login_error=username_taken")
+            if user["disabled"]:
+                con.close()
+                return self._redirect("/?login_error=disabled")
+            cookie = auth.mint_session(con, user["id"], self._client_ip(),
+                                       pending=False)
+            con.execute("UPDATE users SET last_login=? WHERE id=?",
+                        (auth.now_str(), user["id"]))
+            con.commit()
+        finally:
+            con.close()
+        # the one-time state cookie has done its job
+        self._resp_headers.append((
+            "Set-Cookie",
+            "viewer_oidc_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"))
+        self._set_session_cookie(cookie)
+        return self._redirect("/")
 
     def _auth_post(self, path, length):
         """POST /api/auth/*: login, TOTP step, logout, bootstrap, enable/disable.

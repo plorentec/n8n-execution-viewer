@@ -18,10 +18,13 @@ Design notes:
 import base64
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import struct
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 SESSION_COOKIE = "viewer_session"
@@ -216,6 +219,105 @@ def clear_fails(hist, username, ip):
     hist.execute("DELETE FROM login_attempts WHERE username=? AND ip=?",
                  (username, ip))
     hist.commit()
+
+
+# ---------------------------------------------------------------- oidc (T9)
+
+OIDC_STATE_TTL = 600
+
+
+def oidc_enabled():
+    """OIDC is on iff the three required variables are configured."""
+    return all(os.environ.get(k) for k in (
+        "N8N_VIEWER_OIDC_ISSUER", "N8N_VIEWER_OIDC_CLIENT_ID",
+        "N8N_VIEWER_OIDC_CLIENT_SECRET"))
+
+
+def oidc_discovery(issuer, timeout=5):
+    url = issuer.rstrip("/") + "/.well-known/openid-configuration"
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        doc = json.loads(r.read().decode())
+    for key in ("authorization_endpoint", "token_endpoint",
+                "userinfo_endpoint"):
+        if not doc.get(key):
+            raise ValueError("discovery document missing " + key)
+    return doc
+
+
+def oidc_exchange(token_endpoint, code, verifier, redirect_uri,
+                  client_id, client_secret, timeout=5):
+    """Swap the authorization code for tokens. The request goes server to
+    server over the backchannel, so the access token never transits the
+    browser — that is why no JWT signature verification is needed: tokens
+    only travel over this direct TLS connection to the IdP."""
+    form = urllib.parse.urlencode({
+        "grant_type": "authorization_code", "code": code,
+        "redirect_uri": redirect_uri, "client_id": client_id,
+        "client_secret": client_secret, "code_verifier": verifier,
+    }).encode()
+    basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    req = urllib.request.Request(token_endpoint, data=form, method="POST",
+                                 headers={
+                                     "Content-Type":
+                                         "application/x-www-form-urlencoded",
+                                     "Authorization": "Basic " + basic})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def oidc_userinfo(userinfo_endpoint, access_token, timeout=5):
+    req = urllib.request.Request(
+        userinfo_endpoint, headers={"Authorization": "Bearer " + access_token})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def _b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _b64url_decode(text):
+    return base64.urlsafe_b64decode(text + "=" * ((4 - len(text) % 4) % 4))
+
+
+def oidc_id_token_claims(id_token):
+    """Decode the payload WITHOUT verifying the signature: acceptable only
+    because the token came straight from the IdP over the backchannel."""
+    try:
+        payload = id_token.split(".")[1]
+        return json.loads(_b64url_decode(payload))
+    except (ValueError, IndexError, TypeError):
+        return {}
+
+
+def oidc_pack_state(bundle):
+    """Signed, self-contained state cookie payload (state + PKCE + nonce)."""
+    bundle = dict(bundle)
+    bundle["exp"] = int(time.time()) + OIDC_STATE_TTL
+    body = _b64url(json.dumps(bundle).encode())
+    return body + "." + _sign(body, bundle["exp"])
+
+
+def oidc_unpack_state(cookie_value):
+    if not cookie_value or "." not in cookie_value:
+        return None
+    body, sig = cookie_value.rsplit(".", 1)
+    if not hmac.compare_digest(sig, _sign(body, _state_exp(body))):
+        return None
+    try:
+        bundle = json.loads(_b64url_decode(body))
+    except ValueError:
+        return None
+    if bundle.get("exp", 0) < time.time():
+        return None
+    return bundle
+
+
+def _state_exp(body):
+    try:
+        return json.loads(_b64url_decode(body)).get("exp", 0)
+    except ValueError:
+        return 0
 
 
 # ---------------------------------------------------------------- users

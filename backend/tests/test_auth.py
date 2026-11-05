@@ -17,6 +17,7 @@ import threading
 import time
 import unittest
 import urllib.request
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -89,8 +90,16 @@ class AuthTestBase(unittest.TestCase):
             parsed = data.decode()
         return res.status, parsed, set_cookie
 
-    def cookie_value(self, set_cookie):
-        return set_cookie.split(";")[0].split("=", 1)[1] if set_cookie else None
+    def cookie_value(self, set_cookie, name="viewer_session"):
+        """Extract one cookie value. http.client joins multiple Set-Cookie
+        headers with ', ' (the callback sends two: state clear + session)."""
+        if not set_cookie:
+            return None
+        for part in set_cookie.replace(", ", ",").split(","):
+            k, _, v = part.strip().partition("=")
+            if k == name:
+                return v
+        return None
 
 
 class TestBootstrapAndLogin(AuthTestBase):
@@ -333,3 +342,243 @@ class TestPrimitives(unittest.TestCase):
             self.assertEqual(p1, p2)
             mode = os.stat(os.path.join(d, ".session_secret")).st_mode & 0o777
             self.assertEqual(mode, 0o600)
+
+
+# ---------------------------------------------------------------- OIDC (T9)
+
+class _StubIdP:
+    """A minimal OpenID Provider on an ephemeral port: discovery, token and
+    userinfo endpoints. Tracks the last token request for assertions."""
+
+    def __init__(self, groups=(), fail_token=False):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        outer = self
+        outer.last_token = None
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, payload, ctype="application/json"):
+                body = json.dumps(payload).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path.startswith("/auth?"):
+                    q = urllib.parse.parse_qs(
+                        urllib.parse.urlparse(self.path).query)
+                    outer.nonce = (q.get("nonce") or [""])[0]
+                    return self._send(200, {"ok": True})
+                if self.path.startswith("/.well-known/openid-configuration"):
+                    return self._send(200, {
+                        "issuer": outer.issuer,
+                        "authorization_endpoint": outer.issuer + "/auth",
+                        "token_endpoint": outer.issuer + "/token",
+                        "userinfo_endpoint": outer.issuer + "/userinfo",
+                    })
+                if self.path.startswith("/userinfo"):
+                    if self.headers.get("Authorization") != "Bearer good-access":
+                        return self._send(401, {"error": "invalid_token"})
+                    return self._send(200, {
+                        "preferred_username": outer.username,
+                        "groups": list(outer.groups),
+                    })
+                self._send(404, {"error": "not found"})
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                form = urllib.parse.parse_qs(
+                    self.rfile.read(length).decode())
+                outer.last_token = form
+                if outer.fail_token:
+                    return self._send(400, {"error": "invalid_grant"})
+                if form.get("code") != ["good-code"]:
+                    return self._send(400, {"error": "invalid_grant"})
+                # the real PKCE validation happens against the challenge the
+                # authorization endpoint saw; this stub only records that the
+                # verifier travelled on the backchannel (asserted in tests)
+                if not form.get("code_verifier"):
+                    return self._send(400, {"error": "missing_verifier"})
+                header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+                claims = base64.urlsafe_b64encode(json.dumps({
+                    "iss": outer.issuer, "nonce": outer.nonce,
+                }).encode()).rstrip(b"=").decode()
+                id_token = f"{header}.{claims}.sig"
+                return self._send(200, {"access_token": "good-access",
+                                        "id_token": id_token})
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.httpd.server_address[1]
+        self.issuer = f"http://127.0.0.1:{self.port}"
+        self.verifier = None  # filled with what the backchannel sent
+        self.nonce = "n" * 16
+        self.username = "oidc.pablo"
+        self.groups = groups
+        self.fail_token = fail_token
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+@unittest.skipUnless(hasattr(app.Handler, "_oidc_start"), "T9 not implemented yet")
+class TestOidc(AuthTestBase):
+    def setUp(self):
+        # default config pointing at a stub IdP; individual tests override.
+        # the class shares one history DB: drop previous oidc accounts so
+        # each test sees a fresh identity landscape
+        con = app.history()
+        try:
+            con.execute("DELETE FROM users WHERE source='oidc'")
+            con.commit()
+        finally:
+            con.close()
+        self.idp = _StubIdP()
+        self._env = {}
+        for k, v in {
+            "N8N_VIEWER_OIDC_ISSUER": self.idp.issuer,
+            "N8N_VIEWER_OIDC_CLIENT_ID": "viewer",
+            "N8N_VIEWER_OIDC_CLIENT_SECRET": "sekrit",
+            "N8N_VIEWER_PUBLIC_BASE_URL": "http://127.0.0.1:1",
+        }.items():
+            self._env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+    def tearDown(self):
+        self.idp.stop()
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def start_flow(self):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", "/api/auth/oidc/start")
+        res = conn.getresponse()
+        res.read()
+        conn.close()
+        loc = res.getheader("Location")
+        if res.status == 302 and "login_error" not in loc:
+            # the browser would now visit the IdP authorization endpoint,
+            # which is where the nonce is registered for the id_token
+            urllib.request.urlopen(loc, timeout=5).read()
+        return res.status, loc, res.getheader("Set-Cookie")
+
+    def test_providers_says_oidc_true(self):
+        st, body, _ = self.req("GET", "/api/auth/providers")
+        self.assertEqual(st, 200)
+        self.assertEqual(body, {"oidc": True})
+
+    def test_start_redirects_to_idp_with_pkce_and_state(self):
+        st, loc, setc = self.start_flow()
+        self.assertEqual(st, 302)
+        self.assertTrue(loc.startswith(self.idp.issuer + "/auth?"))
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+        self.assertEqual(q["client_id"], ["viewer"])
+        self.assertEqual(q["response_type"], ["code"])
+        self.assertEqual(q["scope"], ["openid profile email"])
+        self.assertEqual(len(q["state"][0]), 43)
+        self.assertIn("code_challenge", q)
+        self.assertTrue(self.cookie_value(setc, name="viewer_oidc_state"))
+
+    def test_callback_with_good_code_logs_in(self):
+        st, loc, setc = self.start_flow()
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+        state = q["state"][0]
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET",
+                     f"/api/auth/oidc/callback?code=good-code&state={state}",
+                     headers={"Cookie": setc.split(";")[0]})
+        res = conn.getresponse()
+        res.read()
+        conn.close()
+        self.assertEqual(res.status, 302)
+        self.assertTrue(res.getheader("Location").endswith("/"))
+        cookie = self.cookie_value(res.getheader("Set-Cookie"))
+        # the token endpoint saw the PKCE verifier travel on the backchannel
+        self.assertEqual(len(self.idp.last_token.get("code_verifier")[0]), 64)
+        st, body, _ = self.req("GET", "/api/stats", cookie=cookie)
+        self.assertEqual(st, 200)
+        st, body, _ = self.req("GET", "/api/auth/me", cookie=cookie)
+        self.assertEqual(body["user"]["name"], "oidc.pablo")
+        self.assertEqual(body["auth"], "oidc")
+
+    def test_callback_bad_state_is_rejected(self):
+        st, loc, setc = self.start_flow()
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", "/api/auth/oidc/callback?code=good-code&state=wrong")
+        res = conn.getresponse()
+        res.read()
+        conn.close()
+        self.assertEqual(res.status, 302)
+        self.assertIn("login_error", res.getheader("Location"))
+
+    def test_callback_idp_failure_is_502(self):
+        self.idp.fail_token = True
+        st, loc, setc = self.start_flow()
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET",
+                     f"/api/auth/oidc/callback?code=good-code&state={q['state'][0]}",
+                     headers={"Cookie": setc.split(";")[0]})
+        res = conn.getresponse()
+        res.read()
+        conn.close()
+        self.assertEqual(res.status, 502)
+
+    def test_admin_group_grants_admin_role(self):
+        self.idp.groups = ["viewer-admins"]
+        os.environ["N8N_VIEWER_OIDC_ADMIN_GROUP"] = "viewer-admins"
+        try:
+            st, loc, setc = self.start_flow()
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+            conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+            conn.request("GET",
+                         f"/api/auth/oidc/callback?code=good-code&state={q['state'][0]}",
+                         headers={"Cookie": setc.split(";")[0]})
+            res = conn.getresponse()
+            res.read()
+            conn.close()
+            cookie = self.cookie_value(res.getheader("Set-Cookie"))
+            st, body, _ = self.req("GET", "/api/auth/me", cookie=cookie)
+            self.assertEqual(body["user"]["role"], "admin")
+        finally:
+            os.environ.pop("N8N_VIEWER_OIDC_ADMIN_GROUP", None)
+
+    def test_no_admin_group_is_viewer(self):
+        st, loc, setc = self.start_flow()
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET",
+                     f"/api/auth/oidc/callback?code=good-code&state={q['state'][0]}",
+                     headers={"Cookie": setc.split(";")[0]})
+        res = conn.getresponse()
+        res.read()
+        conn.close()
+        cookie = self.cookie_value(res.getheader("Set-Cookie"))
+        st, body, _ = self.req("GET", "/api/auth/me", cookie=cookie)
+        self.assertEqual(body["user"]["role"], "viewer")
+        # a second login does not duplicate the account
+        st, loc, setc = self.start_flow()
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET",
+                     f"/api/auth/oidc/callback?code=good-code&state={q['state'][0]}",
+                     headers={"Cookie": setc.split(";")[0]})
+        res = conn.getresponse()
+        res.read()
+        conn.close()
+        con = app.history()
+        try:
+            n = con.execute("SELECT count(*) FROM users WHERE username=?",
+                            ("oidc.pablo",)).fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(n, 1)
