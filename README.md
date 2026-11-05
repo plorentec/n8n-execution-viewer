@@ -1,5 +1,9 @@
 # n8n-execution-viewer
 
+The deployed UI ships with the same install/deploy guide in Spanish under
+`frontend/docs.html` (linked as **Docs** in the header) — the pages below
+are the English source of truth.
+
 A permanent, searchable history for your n8n executions.
 
 n8n prunes old executions (the default retention keeps only recent runs).

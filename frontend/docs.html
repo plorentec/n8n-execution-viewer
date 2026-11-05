@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documentación · n8n execution viewer</title>
+<style>
+  :root{
+    --bg:#f4f5f7; --card:#fff; --ink:#1d2129; --ink2:#5a6270;
+    --line:#e3e6ec; --accent:#f0b400; --accent-ink:#201800;
+    --code-bg:#1d2129; --code-ink:#e8eaf0; --ok:#0a8a4a; --warn:#b3590a;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#14161b; --card:#1d2129; --ink:#e8eaf0; --ink2:#9aa2b1;
+      --line:#2a2f3a; --code-bg:#0f1116; --code-ink:#d7dbe4; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.65 "Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  a{color:var(--ink);text-decoration-color:var(--accent)}
+  .top{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+  .top-in{max-width:960px;margin:0 auto;padding:12px 20px;display:flex;align-items:center;gap:14px}
+  .top .back{display:inline-flex;align-items:center;gap:6px;font-weight:700;font-size:13.5px;
+    padding:8px 14px;border-radius:9px;border:1px solid var(--line);background:var(--bg);
+    color:var(--ink);text-decoration:none}
+  .top .back:hover{border-color:var(--accent)}
+  .top h1{font-size:15px;margin:0;font-weight:800}
+  .top .gh{margin-left:auto;font-size:13px;color:var(--ink2);text-decoration:none;font-weight:600}
+  .top .gh:hover{color:var(--ink)}
+  main{max-width:960px;margin:0 auto;padding:28px 20px 80px}
+  .lead{color:var(--ink2);font-size:16px;max-width:70ch}
+  h2{font-size:21px;font-weight:800;margin:42px 0 6px;padding-top:18px;border-top:1px solid var(--line)}
+  h2:first-of-type{border-top:0;padding-top:0;margin-top:24px}
+  h3{font-size:16px;font-weight:800;margin:26px 0 4px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin:16px 0}
+  .opt{border-left:4px solid var(--accent)}
+  .opt .tag{display:inline-block;font-size:11.5px;font-weight:800;letter-spacing:.4px;
+    text-transform:uppercase;background:var(--accent);color:var(--accent-ink);
+    padding:2px 9px;border-radius:99px;vertical-align:2px;margin-left:8px}
+  pre{background:var(--code-bg);color:var(--code-ink);border-radius:10px;padding:14px 16px;
+    overflow-x:auto;font-size:12.8px;line-height:1.55}
+  code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  p code, li code, td code{background:var(--code-bg);color:var(--code-ink);
+    border-radius:5px;padding:1px 6px;font-size:12.5px}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--bg);font-weight:700}
+  .pill-ok{color:var(--ok);font-weight:700}
+  .pill-warn{color:var(--warn);font-weight:700}
+  .note{border-left:4px solid var(--warn);background:var(--card);border-radius:0 10px 10px 0;
+    padding:12px 16px;margin:14px 0}
+  .note b{display:block;margin-bottom:2px}
+  .schema{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.3px;line-height:1.5;
+    white-space:pre;overflow-x:auto;background:var(--code-bg);color:var(--code-ink);
+    border-radius:10px;padding:16px 18px;margin:14px 0}
+  .toc{columns:2;gap:26px;font-size:14px;margin:10px 0 0;padding:0;list-style:none}
+  .toc li{margin:5px 0;break-inside:avoid}
+  .toc a{text-decoration:none;font-weight:600}
+  .toc a:hover{color:var(--accent)}
+  footer{max-width:960px;margin:0 auto;padding:0 20px 60px;color:var(--ink2);font-size:13px}
+</style>
+</head>
+<body>
+<div class="top"><div class="top-in">
+  <a class="back" href="index.html">← Volver al visor</a>
+  <h1>Documentación</h1>
+  <a class="gh" href="https://github.com/plorentec/n8n-execution-viewer" target="_blank" rel="noopener">GitHub ↗</a>
+</div></div>
+
+<main>
+  <p class="lead">n8n borra su propio histórico de ejecuciones (por defecto lo conserva unos
+  días). Este servicio mantiene una <b>copia acumulativa e independiente</b> de todas tus
+  ejecuciones, con búsqueda a texto completo, sin tocar nunca la base de datos de n8n.
+  Esta guía explica cómo instalarlo <b>al lado de un n8n que ya corre en Docker</b>, las
+  opciones que tienes y cómo elegir entre ellas.</p>
+
+  <ul class="toc">
+    <li><a href="#como-funciona">1. Cómo accede a la base de datos</a></li>
+    <li><a href="#requisitos">2. Requisitos previos</a></li>
+    <li><a href="#opcion-a">3. Opción A — sidecar en tu compose</a></li>
+    <li><a href="#opcion-b">4. Opción B — contenedor independiente (Portainer)</a></li>
+    <li><a href="#opcion-c">5. Opción C — servicio nativo sin contenedor</a></li>
+    <li><a href="#decision">6. ¿Qué opción me conviene?</a></li>
+    <li><a href="#proxy">7. Servir la interfaz (proxy)</a></li>
+    <li><a href="#config">8. Configuración (variables de entorno)</a></li>
+    <li><a href="#actualizar">9. Actualizar sin perder el histórico</a></li>
+    <li><a href="#backup">10. Copias de seguridad</a></li>
+    <li><a href="#faq">11. Problemas frecuentes</a></li>
+  </ul>
+
+  <h2 id="como-funciona">1 · Cómo accede a la base de datos</h2>
+  <p>Es la pregunta más importante y tiene una respuesta tranquilizadora: <b>SQLite no es un
+  servidor</b>. No hay puerto, ni protocolo de red, ni usuario ni contraseña — como sí los hay
+  en MySQL o Postgres. SQLite es <b>un fichero</b> (<code>database.sqlite</code>) que n8n
+  escribe en su volumen de Docker.</p>
+  <p>Docker permite montar el mismo volumen en dos contenedores a la vez. El viewer monta el
+  volumen de n8n <b>en modo solo-lectura</b> (<code>:ro</code>) y abre el fichero con el modo
+  read-only del propio SQLite. n8n <b>no participa en nada</b>: no hay token, ni webhook, ni
+  llamada a su API, ni siquiera sabe que el viewer existe.</p>
+
+  <div class="schema">      TU SERVIDOR (donde vive el Docker de n8n)
+┌────────────────────────────────────────────────────────────────┐
+│  VOLUMEN Docker de n8n (el que ya existe)                      │
+│  └── database.sqlite          ← el fichero real                │
+│         │                                │                     │
+│   montado en n8n                   montado en el viewer        │
+│   lectura/escritura                SOLO LECTURA (:ro)          │
+│         │                                │                     │
+│  ┌──────▼───────┐              ┌─────────▼──────────┐          │
+│  │ contenedor   │              │ contenedor          │          │
+│  │ n8n (intacto)│              │ n8n-viewer          │          │
+│  └──────────────┘              └─────────┬──────────┘          │
+│  sin contacto entre ambos      su PROPIO histórico,       │
+│                                en otro volumen, crece     │
+│                                para siempre               │
+└────────────────────────────────────────────┬───────────────────┘
+                                             │ HTTP :8391
+                                    tu proxy / Portainer → usuarios</div>
+
+  <p><b>La garantía de solo-lectura es del kernel, no una promesa del código.</b> Con
+  <code>:ro</code>, aunque el viewer tuviera un bug, el sistema operativo le deniega cualquier
+  escritura sobre el volumen de n8n. Lo único que escribe el viewer es su propio histórico
+  (<code>history.db</code>), en un volumen aparte.</p>
+
+  <h2 id="requisitos">2 · Requisitos previos</h2>
+  <table>
+    <tr><th>Requisito</th><th>Detalle</th></tr>
+    <tr><td><b>n8n con SQLite</b></td><td>El modo por defecto de la imagen oficial. Comprueba
+      que exista <code>database.sqlite</code> dentro del volumen de datos de n8n
+      (<code>/home/node/.n8n/database.sqlite</code>). Instancias con <b>Postgres no están
+      soportadas</b>.</td></tr>
+    <tr><td><b>Mismo host / kernel</b></td><td>El viewer debe correr en la misma máquina que
+      n8n. Compartir el fichero por NFS o por red <b>no está soportado</b>: SQLite es conocido
+      por corromperse sobre sistemas de ficheros de red.</td></tr>
+    <tr><td><b>Construir la imagen una vez</b></td><td>No hay imagen publicada en un registro
+      todavía. En el host donde corre n8n:
+      <code>docker build -t n8n-execution-viewer .</code> (el repo pesa poco; la imagen son
+      tres ficheros Python sobre <code>python:3.12-slim</code>, sin dependencias).</td></tr>
+    <tr><td><b>Saber tu volumen</b></td><td>Todas las opciones necesitan el nombre del volumen
+      de n8n y dónde se monta dentro del contenedor:</td></tr>
+  </table>
+  <pre>docker inspect &lt;contenedor-de-n8n&gt; --format \
+  '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{println}}{{end}}'
+
+# salida típica con la imagen oficial:
+#   n8n_data -> /home/node/.n8n
+# ⇒ el fichero es /home/node/.n8n/database.sqlite (dentro del volumen)</pre>
+
+  <h2 id="opcion-a">3 · Opción A — sidecar en tu stack de compose <span class="tag">recomendada</span></h2>
+  <div class="card opt">
+    <p><b>Cuándo:</b> tu n8n está definido en un <code>docker-compose.yml</code> (tuyo o del
+    equipo de infra). Es la opción más limpia: el viewer queda <b>declarado junto a n8n</b>,
+    versionado en el mismo fichero, y <code>docker compose up -d</code> levanta ambos tras un
+    reinicio del host.</p>
+    <p><b>Cómo:</b> añade este servicio al compose que ya define tu n8n (ajusta
+    <code>n8n_data</code> al nombre real de tu volumen):</p>
+<pre>services:
+  n8n-viewer:
+    image: n8n-execution-viewer
+    restart: unless-stopped
+    environment:
+      - N8N_DB_PATH=/data/database.sqlite   # ruta DENTRO del volumen
+      # - N8N_VIEWER_RETENTION_DAYS=180     # opcional: conservar N días (0 = siempre)
+    volumes:
+      - n8n_data:/data:ro                   # el MISMO volumen que usa n8n
+      - n8n-viewer_history:/var/lib/n8n-viewer
+    ports:
+      - "127.0.0.1:8391:8391"               # loopback; delante irá tu proxy
+
+volumes:
+  n8n-viewer_history:
+  # NO redeclares n8n_data aquí si tu servicio n8n ya lo define en este
+  # mismo fichero: reutiliza su nombre tal cual</pre>
+    <p><b>Ventajas:</b> un solo fichero gobierna todo el stack; el viewer se reinicia,
+    actualiza y respalda con las mismas herramientas que n8n. <b>Contras:</b> tocar el compose
+    de producción puede requerir tu proceso de cambio habitual.</p>
+  </div>
+
+  <h2 id="opcion-b">4 · Opción B — contenedor independiente (Portainer o docker run)</h2>
+  <div class="card opt">
+    <p><b>Cuándo:</b> gestionas n8n desde la <b>UI de Portainer</b> o con <code>docker run</code>,
+    y prefieres <b>no tocar para nada</b> tu stack de n8n. El viewer es un contenedor nuevo que
+    adjunta el volumen <i>existente</i> de n8n como volumen externo.</p>
+    <p><b>Cómo (CLI):</b></p>
+<pre>docker volume create n8n-viewer_history
+
+docker run -d --name n8n-viewer --restart unless-stopped \
+  -e N8N_DB_PATH=/data/database.sqlite \
+  -p 127.0.0.1:8391:8391 \
+  -v n8n_data:/data:ro \
+  -v n8n-viewer_history:/var/lib/n8n-viewer \
+  n8n-execution-viewer</pre>
+    <p><b>Cómo (Portainer, por UI):</b></p>
+    <ol>
+      <li><b>Volumes</b>: localiza el nombre del volumen de datos de tu n8n (el mismo que
+      viste con <code>docker inspect</code>).</li>
+      <li><b>Containers → Add container</b>: imagen <code>n8n-execution-viewer</code>,
+      mapeo de puerto <code>8391</code> (solo en <code>127.0.0.1</code> si tu proxy corre en el
+      host), variable de entorno <code>N8N_DB_PATH=/data/database.sqlite</code>.</li>
+      <li>En <b>Advanced settings → Volumes</b>, añade <b>dos</b>: el volumen de n8n con el
+      toggle <b>Read-only</b> activado montado en <code>/data</code>, y un volumen nuevo
+      (<code>n8n-viewer_history</code>) montado en <code>/var/lib/n8n-viewer</code>.</li>
+      <li><b>Deploy the container</b>. La primera sincronización importa todo el histórico
+      disponible y después avanza sola cada 5 minutos.</li>
+    </ol>
+    <p><b>Actualizar más adelante:</b> <code>docker rm -f n8n-viewer</code> y vuelve a lanzar
+    el mismo comando — el volumen del histórico <b>no</b> se toca, así que no pierdes ninguna
+    ejecución. <b>Ventajas:</b> cero cambios en tu stack; aíslalo o elimíname cuando quieras.
+    <b>Contras:</b> no queda declarado en ningún compose (documéntalo en tu runbook).</p>
+  </div>
+
+  <h2 id="opcion-c">5 · Opción C — servicio nativo, sin segundo contenedor</h2>
+  <div class="card opt">
+    <p><b>Cuándo:</b> tu política es <b>un proceso por contenedor</b>, no quieres otra imagen
+    que mantener, o simplemente prefieres un servicio systemd clásico. El instalador detecta
+    el contenedor de n8n que está corriendo, lee la ruta real de su volumen bajo
+    <code>/var/lib/docker/volumes/…</code> y monta el backend como servicio del sistema que
+    lee ese fichero en solo-lectura.</p>
+<pre>curl -fsSL https://raw.githubusercontent.com/plorentec/n8n-execution-viewer/main/install.sh \
+  | sudo bash -s -- \
+  --n8n-db /var/lib/docker/volumes/n8n_data/_data/database.sqlite</pre>
+    <p>Con <code>--dry-run</code> ves cada paso sin ejecutar nada; el auto-detección cubre la
+    ruta oficial del volumen y un contenedor en marcha. Copia el frontend a
+    <code>/var/www/n8n-viewer/</code> y deja preparado Apache si existe. <b>Ventajas:</b>
+    nada nuevo en Docker; gestión con <code>systemctl</code>. <b>Contras:</b> necesitas Python
+    ≥ 3.9 en el host (stdlib, sin paquetes) y el backend corre fuera del aislamiento de
+    Docker.</p>
+  </div>
+
+  <h2 id="decision">6 · ¿Qué opción me conviene?</h2>
+  <table>
+    <tr><th></th><th>A · sidecar compose</th><th>B · contenedor suelto</th><th>C · nativo</th></tr>
+    <tr><td><b>Gestionas n8n con…</b></td><td>docker-compose.yml</td><td>Portainer UI / docker run</td><td>systemd / scripts</td></tr>
+    <tr><td><b>Toca tu stack de n8n</b></td><td>Una línea en el mismo fichero</td><td class="pill-ok">No, en absoluto</td><td class="pill-ok">No, en absoluto</td></tr>
+    <tr><td><b>Sobrevive a un reinicio del host</b></td><td class="pill-ok">Sí (compose)</td><td class="pill-ok">Sí (restart policy)</td><td class="pill-ok">Sí (systemd)</td></tr>
+    <tr><td><b>Actualizar el viewer</b></td><td>build + up -d</td><td>rm -f + run (histórico intacto)</td><td>git pull + restart</td></tr>
+    <tr><td><b>Aislamiento</b></td><td class="pill-ok">Contenedor</td><td class="pill-ok">Contenedor</td><td class="pill-warn">Proceso del host</td></tr>
+    <tr><td><b>Requiere Python en el host</b></td><td class="pill-ok">No</td><td class="pill-ok">No</td><td>Sí (≥ 3.9, stdlib)</td></tr>
+  </table>
+
+  <h2 id="proxy">7 · Servir la interfaz (proxy)</h2>
+  <p>El viewer solo publica su API en <code>127.0.0.1:8391</code>. La interfaz son ficheros
+  estáticos (<code>frontend/</code>) que sirve cualquier web server. Ejemplos:</p>
+  <h3>Apache (subpath)</h3>
+<pre>Alias /n8n-viewer /var/www/n8n-viewer
+ProxyPass /n8n-viewer/api/ http://127.0.0.1:8391/api/
+ProxyPassReverse /n8n-viewer/api/ http://127.0.0.1:8391/api/
+ProxyPass /n8n-viewer !
+</pre>
+  <h3>nginx (subpath)</h3>
+<pre>location /n8n-viewer/ {
+    alias /var/www/n8n-viewer/;
+    location /n8n-viewer/api/ { proxy_pass http://127.0.0.1:8391/api/; }
+}</pre>
+  <h3>Caddy / Traefik</h3>
+  <p>Una ruta estática hacia <code>frontend/</code> más un router
+  <code>/n8n-viewer/api/* → 127.0.0.1:8391</code>. El frontend usa rutas relativas, así que
+  funciona igual en un subpath o en un subdominio propio
+  (<code>n8n-viewer.tuempresa.com</code> apuntando a la raíz de <code>frontend/</code>).</p>
+  <div class="note"><b>Protege el acceso.</b> El histórico contiene el texto completo de tus
+  ejecuciones (payloads, credenciales que los flujos manejen…). Restringe por red (LAN/VPN)
+  o pon autenticación delante. En el repo hay un ejemplo de <code>Require ip</code> en
+  <code>deploy/apache-notes.conf</code>.</div>
+
+  <h2 id="config">8 · Configuración (variables de entorno)</h2>
+  <table>
+    <tr><th>Variable</th><th>Defecto</th><th>Qué hace</th></tr>
+    <tr><td><code>N8N_DB_PATH</code></td><td>—</td><td>Ruta del <code>database.sqlite</code> de n8n dentro del contenedor (siempre <code>/data/database.sqlite</code> con el montaje estándar).</td></tr>
+    <tr><td><code>N8N_VIEWER_DB</code></td><td><code>/var/lib/n8n-viewer/history.db</code></td><td>Tu histórico acumulativo. Ponlo en un volumen propio.</td></tr>
+    <tr><td><code>N8N_VIEWER_SYNC_INTERVAL</code></td><td><code>300</code></td><td>Segundos entre sincronizaciones automáticas.</td></tr>
+    <tr><td><code>N8N_VIEWER_RETENTION_DAYS</code></td><td><code>0</code> (siempre)</td><td>Días a conservar en el histórico (también configurable desde el engranaje de la UI). Nunca borra nada de n8n.</td></tr>
+    <tr><td><code>N8N_VIEWER_MAX_BLOB_MB</code></td><td><code>50</code></td><td>Salta el payload de ejecuciones mayores (quedan en la lista marcadas "sin datos" en vez de cargarse en memoria).</td></tr>
+    <tr><td><code>N8N_VIEWER_PAGE_SIZE</code></td><td><code>50</code></td><td>Ejecuciones por página.</td></tr>
+    <tr><td><code>N8N_URL</code></td><td>vacío</td><td>Si la defines, aparecen enlaces "abrir en n8n". Vacío = ocultos.</td></tr>
+  </table>
+  <p>La marca (título, subtítulo, logo) y la retención se cambian <b>desde la propia UI</b>
+  (engranaje) y se guardan junto al histórico — sobreviven a actualizaciones.</p>
+
+  <h2 id="actualizar">9 · Actualizar sin perder el histórico</h2>
+  <ol>
+    <li><code>git pull</code> del repo (o descarga el tarball del release).</li>
+    <li><code>docker build -t n8n-execution-viewer .</code></li>
+    <li><b>Opción A:</b> <code>docker compose up -d n8n-viewer</code> ·
+        <b>Opción B:</b> <code>docker rm -f n8n-viewer</code> y el mismo <code>docker run</code>.</li>
+  </ol>
+  <p>El histórico vive en <b>su propio volumen</b>, así que recrear el contenedor nunca borra
+  ejecuciones. La primera vez que la retención borre datos de verdad, el fichero se compacta
+  una única vez (puede tardar unos segundos en históricos grandes; las lecturas siguen
+  funcionando durante ese tiempo).</p>
+
+  <h2 id="backup">10 · Copias de seguridad</h2>
+  <p>Lo único con valor único es <code>history.db</code> (y su <code>-wal</code> si existe) en
+  el volumen del histórico. Todo lo demás (contenedor, imagen, frontend) se puede regenerar
+  desde el repo. Un <code>sqlite3 history.db ".backup copia.db"</code> desde cron semanal es
+  suficiente; hacer backup del volumen de n8n <b>no</b> es necesario para este servicio.</p>
+
+  <h2 id="faq">11 · Problemas frecuentes</h2>
+  <h3>El viewer no abre la base de datos: permission denied</h3>
+  <p>El volumen de n8n pertenece a uid 1000 con ficheros <code>0600</code>. La imagen corre
+  como root precisamente para poder leerlo (montada <code>:ro</code>, el root del contenedor
+  no puede escribir igualmente). Si corrías el viewer con <code>--user</code>, quítalo o dale
+  acceso de lectura al grupo.</p>
+  <h3>La BD se corrompe / da errores raros de disco</h3>
+  <p>Casi siempre significa que el volumen se comparte por red (NFS/SMB) o que hay dos
+  equipos escribiendo el mismo fichero. SQLite solo es seguro en el mismo kernel: el viewer
+  en el mismo host que n8n, siempre.</p>
+  <h3>Uso Postgres con n8n y el viewer no encuentra ejecuciones</h3>
+  <p>No soportado (todavía): el viewer lee el formato SQLite. Si tu n8n está en Postgres,
+  esta herramienta no es para ti por ahora.</p>
+  <h3>Tras configurar Apache, el API da 404 o el navegador un 502</h3>
+  <p>Recuerda las <b>tres</b> líneas del proxy (incluido <code>ProxyPass /n8n-viewer !</code>
+  antes de cualquier catch-all): sin la exclusión, tu vhost por defecto se come la ruta.
+  Si usas un dominio con <code>www.</code>, cada vhost necesita su propio bloque.</p>
+  <h3>Activé retención y el fichero no encoge</h3>
+  <p>El borrado libera espacio en la siguiente pasada de sincronización que efectivamente
+  borre filas; en históricos creados antes de la v1.0.1 la compactación total ocurre una
+  única vez (VACUUM). Comprueba el progreso con la tarjeta "Disco" de la UI.</p>
+
+  <footer>
+    n8n-execution-viewer · MIT ·
+    <a href="https://github.com/plorentec/n8n-execution-viewer">código y issues en GitHub</a>
+  </footer>
+</main>
+</body>
+</html>
