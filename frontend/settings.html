@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ajustes · n8n execution viewer</title>
+<style>
+  :root{
+    --bg:#f4f5f7; --card:#fff; --ink:#1d2129; --ink2:#5a6270;
+    --line:#e3e6ec; --accent:#f0b400; --accent-ink:#201800;
+    --ok:#0a8a4a; --err:#b3261e;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#14161b; --card:#1d2129; --ink:#e8eaf0; --ink2:#9aa2b1; --line:#2a2f3a; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.65 "Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  a{color:var(--ink);text-decoration-color:var(--accent)}
+  .top{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+  .top-in{max-width:860px;margin:0 auto;padding:12px 20px;display:flex;align-items:center;gap:14px}
+  .top .back{display:inline-flex;align-items:center;gap:6px;font-weight:700;font-size:13.5px;
+    padding:8px 14px;border-radius:9px;border:1px solid var(--line);background:var(--bg);
+    color:var(--ink);text-decoration:none}
+  .top .back:hover{border-color:var(--accent)}
+  .top h1{font-size:15px;margin:0;font-weight:800}
+  .top .gh{margin-left:auto;font-size:13px;color:var(--ink2);text-decoration:none;font-weight:600}
+  .top .gh:hover{color:var(--ink)}
+  main{max-width:860px;margin:0 auto;padding:26px 20px 80px}
+  h2{font-size:19px;font-weight:800;margin:34px 0 8px;padding-top:20px;border-top:1px solid var(--line)}
+  h2:first-of-type{border-top:0;padding-top:0;margin-top:10px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin:14px 0}
+  .lbl{display:block;font-size:12px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;
+    color:var(--ink2);margin:14px 0 4px}
+  input,select{width:100%;max-width:420px;background:var(--card);color:var(--ink);
+    border:1px solid var(--line);border-radius:9px;padding:9px 12px;font:inherit}
+  input:focus,select:focus{outline:none;border-color:var(--accent)}
+  .hint{color:var(--ink2);font-size:13px;margin:6px 0 0}
+  .actions{display:flex;gap:10px;align-items:center;margin-top:16px;flex-wrap:wrap}
+  .btn{display:inline-flex;align-items:center;gap:8px;padding:9px 16px;border-radius:9px;
+    font-size:13.5px;font-weight:700;cursor:pointer;border:1px solid var(--line);
+    background:var(--card);color:var(--ink);text-decoration:none}
+  .btn:hover{border-color:var(--accent)}
+  .btn-primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+  .btn-sm{padding:6px 12px;font-size:12.5px}
+  .btn:disabled{opacity:.55;cursor:not-allowed}
+  .msg{font-size:13.5px;min-height:20px}
+  .msg.is-error{color:var(--err);font-weight:600}
+  .logo-preview{width:44px;height:44px;border-radius:10px;display:block;margin-top:8px}
+  .user-row{display:flex;align-items:center;gap:8px;padding:8px 0;
+    border-bottom:1px dashed var(--line);flex-wrap:wrap}
+  .user-row:last-child{border-bottom:none}
+  .user-name{font-weight:700;min-width:110px}
+  .user-role{font-size:11.5px;background:var(--bg);border:1px solid var(--line);
+    border-radius:99px;padding:1px 8px}
+  .user-totp{font-size:11px;color:var(--ok);font-weight:800}
+  .user-off{font-size:11px;color:var(--err);font-weight:700}
+  .user-last{color:var(--ink2);font-size:12px}
+  .user-acts{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
+  .user-new{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+  .user-new input,.user-new select{flex:1 1 130px;width:auto;min-width:0}
+  .totp-input{letter-spacing:8px;font-size:20px;text-align:center;width:150px;
+    font-family:ui-monospace,monospace}
+  .totp-qr{width:180px;height:180px;border-radius:8px;display:block;margin:6px 0}
+  .totp-secret{display:block;word-break:break-all;background:var(--bg);
+    border:1px solid var(--line);border-radius:8px;padding:6px 10px;margin:6px 0;
+    font-size:13px;user-select:all;font-family:ui-monospace,monospace}
+  .hidden{display:none !important}
+</style>
+</head>
+<body>
+<div class="top"><div class="top-in">
+  <a class="back" href="index.html">← Volver al visor</a>
+  <h1>Ajustes</h1>
+  <a class="gh" href="https://github.com/plorentec/n8n-execution-viewer" target="_blank" rel="noopener">GitHub ↗</a>
+</div></div>
+
+<main>
+  <section>
+    <h2>Historial</h2>
+    <div class="card">
+      <label class="lbl" for="cfg-retention">Conservar ejecuciones durante</label>
+      <select id="cfg-retention">
+        <option value="0">Para siempre</option>
+        <option value="30">30 días</option>
+        <option value="90">90 días</option>
+        <option value="180">180 días</option>
+        <option value="365">1 año</option>
+        <option value="730">2 años</option>
+        <option value="custom">Personalizado…</option>
+      </select>
+      <input id="cfg-retention-custom" type="number" min="1" max="36500" placeholder="días" class="hidden">
+      <p class="hint">Lo anterior a ese plazo se borra del histórico en la próxima sincronización.
+      La base de datos de n8n nunca se toca. También puedes cambiarlo por variables de entorno.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Marca</h2>
+    <div class="card">
+      <label class="lbl" for="cfg-title">Título</label>
+      <input id="cfg-title" type="text" maxlength="200" placeholder="Tu empresa">
+      <label class="lbl" for="cfg-subtitle">Subtítulo</label>
+      <input id="cfg-subtitle" type="text" maxlength="200" placeholder="n8n execution viewer">
+      <label class="lbl" for="cfg-logo-file">Logo (hasta 2 MB)</label>
+      <input id="cfg-logo-file" type="file" accept="image/*">
+      <img id="cfg-logo-preview" class="logo-preview" alt="" hidden>
+      <button id="cfg-logo-clear" class="btn btn-sm" type="button" hidden>Quitar</button>
+      <p class="hint">Dejar un campo vacío vuelve al valor por defecto.</p>
+    </div>
+    <div class="actions">
+      <button id="settings-save" class="btn btn-primary" type="button">Guardar</button>
+      <span id="settings-msg" class="msg" aria-live="polite"></span>
+    </div>
+  </section>
+
+  <section id="sec-users" class="hidden">
+    <h2>Usuarios</h2>
+    <div class="card">
+      <div id="users-list"></div>
+      <div class="user-new">
+        <input id="user-new-name" type="text" placeholder="usuario" autocomplete="off">
+        <input id="user-new-pass" type="password" placeholder="contraseña (min 8)">
+        <select id="user-new-role">
+          <option value="viewer">Viewer</option>
+          <option value="admin">Admin</option>
+        </select>
+        <button id="user-new-add" class="btn btn-sm" type="button">Añadir</button>
+      </div>
+      <p class="hint" id="users-msg" aria-live="polite"></p>
+    </div>
+  </section>
+
+  <section id="sec-totp" class="hidden">
+    <h2>Mi 2FA</h2>
+    <div class="card">
+      <div id="totp-area"></div>
+    </div>
+  </section>
+</main>
+
+<script src="vendor/qrcodegen.js"></script>
+<script type="module" src="settings.js"></script>
+</body>
+</html>

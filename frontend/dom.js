@@ -1,5 +1,8 @@
 // Element builder. Text is always set with textContent / text nodes, never HTML.
 
+// Short by-id lookup shared by every page that loads this module.
+export const $ = (id) => document.getElementById(id);
+
 // Callers pass nested arrays (e.g. pairs from map) and optional children
 // (cond ? node : null), so flatten fully and drop null, undefined and false.
 // The DOM itself would turn null into the text "null".
