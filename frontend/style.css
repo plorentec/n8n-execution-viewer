@@ -473,3 +473,34 @@ footer b { color: var(--primary); }
 .modal-foot { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 16px; }
 .settings-msg { font-size: 12.5px; font-weight: 600; color: var(--ok); margin-right: auto; }
 .settings-msg.err { color: var(--fail); }
+
+/* ---------- auth (T10) ---------- */
+
+.login-modal { max-width: 380px; width: 92%; }
+.login-grid { display: grid; grid-template-columns: 1fr; gap: 6px 12px; margin-bottom: 12px; }
+.login-grid .lbl { margin: 6px 0 0; }
+.login-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+.linklike { background: none; border: none; color: var(--text-2); font: inherit; font-size: 12.5px;
+  cursor: pointer; text-decoration: underline; padding: 4px 0; }
+.linklike:hover { color: var(--text); }
+.totp-input { letter-spacing: 8px; font-size: 20px; text-align: center; width: 140px;
+  font-family: ui-monospace, monospace; }
+.totp-qr { width: 180px; height: 180px; border-radius: 8px; display: block; margin: 4px 0; }
+.totp-secret { display: block; word-break: break-all; background: var(--bg-2);
+  border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; margin: 6px 0;
+  font-size: 13px; user-select: all; }
+.set-section { border-top: 1px solid var(--border); margin-top: 18px; padding-top: 12px; }
+.set-section h3 { margin: 0 0 10px; font-size: 14px; font-weight: 800; }
+.user-row { display: flex; align-items: center; gap: 8px; padding: 7px 0;
+  border-bottom: 1px dashed var(--border); flex-wrap: wrap; }
+.user-row:last-child { border-bottom: none; }
+.user-name { font-weight: 700; min-width: 110px; }
+.user-role { font-size: 11.5px; background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: 99px; padding: 1px 8px; }
+.user-totp { font-size: 11px; color: var(--ok, #0a8a4a); font-weight: 800; }
+.user-off { font-size: 11px; color: #b3261e; font-weight: 700; }
+.user-last { color: var(--text-2); font-size: 12px; }
+.user-acts { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+.user-new { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.user-new input, .user-new select { flex: 1 1 120px; min-width: 0; }
+.settings-msg.is-error { color: #b3261e; font-weight: 600; }

@@ -44,8 +44,148 @@ function writePref(key, value) {
 async function api(path) {
   const res = await fetch(API_BASE + path.slice(1));
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(body.error ?? `HTTP ${res.status}`);
+    err.status = res.status;
+    if (res.status === 401) showLogin();
+    throw err;
+  }
   return body;
+}
+
+// ---------- auth (T10) ----------
+
+state.me = null;          // {user:{name,role,totp_enabled}, auth}
+state.providers = null;   // {oidc:bool} — filled before the login screen
+
+function authPost(path, body) {
+  return fetch(API_BASE + path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  }).then(async (res) => ({ status: res.status, data: await res.json().catch(() => ({})) }));
+}
+
+function authSend(method, path, body) {
+  return fetch(API_BASE + path, {
+    method,
+    headers: body !== undefined ? { "content-type": "application/json" } : {},
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  }).then(async (res) => ({ status: res.status, data: await res.json().catch(() => ({})) }));
+}
+
+function isAuthError(err) {
+  if (err && err.status === 401) {
+    showLogin();
+    return true;
+  }
+  return false;
+}
+
+function showLogin() {
+  try {
+    if (location.hash) sessionStorage.setItem("afterLogin", location.hash);
+  } catch { /* sessionStorage is optional */ }
+  $("login-step-credentials").hidden = false;
+  $("login-step-totp").hidden = true;
+  $("login-step-first").hidden = true;
+  $("login-msg").textContent = "";
+  $("login-user").value = "";
+  $("login-pass").value = "";
+  // SSO availability: a 401 answer with providers shape, ignore failures
+  fetch(API_BASE + "api/auth/providers").then((r) => r.json()).then((p) => {
+    state.providers = p;
+    $("login-oidc").hidden = !p.oidc;
+  }).catch(() => { $("login-oidc").hidden = true; });
+  $("logout-btn").hidden = true;
+  $("login-overlay").hidden = false;
+  $("login-user").focus();
+}
+
+function hideLogin() {
+  $("login-overlay").hidden = true;
+  $("logout-btn").hidden = false;
+}
+
+async function enterApp() {
+  hideLogin();
+  initSettings();
+  await Promise.all([loadStats(), loadWorkflows()]);
+  await applyBrand();
+  let hash = "";
+  try { hash = sessionStorage.getItem("afterLogin") || ""; sessionStorage.removeItem("afterLogin"); } catch { /* optional */ }
+  if (hash) location.hash = hash;   // fires hashchange? no: same-document assignment
+  await applyHash();
+  watchSync({ refresh: false });
+}
+
+function showLoginMsg(text, isErr) {
+  const el = $("login-msg");
+  el.textContent = text;
+  el.classList.toggle("is-error", !!isErr);
+}
+
+async function doLogin() {
+  const username = $("login-user").value.trim();
+  const password = $("login-pass").value;
+  if (!username || !password) return showLoginMsg("Usuario y contraseña obligatorios.", true);
+  $("login-submit").disabled = true;
+  try {
+    const { status, data } = await authPost("api/auth/login", { username, password });
+    if (status === 200 && data.status === "ok") {
+      state.me = { user: data.user, auth: "local" };
+      return enterApp();
+    }
+    if (status === 200 && data.status === "totp_required") {
+      state.pendingTotpUser = username;
+      $("login-step-credentials").hidden = true;
+      $("login-step-totp").hidden = false;
+      $("login-totp-code").focus();
+      return;
+    }
+    if (status === 429) {
+      return showLoginMsg(`Demasiados intentos. Espera ${data.retry_after ?? 60} s.`, true);
+    }
+    showLoginMsg("Usuario o contraseña incorrectos.", true);
+  } catch {
+    showLoginMsg("No hay conexión con el servidor.", true);
+  } finally {
+    $("login-submit").disabled = false;
+  }
+}
+
+async function doTotp() {
+  const code = $("login-totp-code").value.trim();
+  if (code.length !== 6) return showTotpMsg("Introduce los 6 dígitos.", true);
+  $("login-totp-submit").disabled = true;
+  try {
+    const { status, data } = await authPost("api/auth/totp", { code });
+    if (status === 200 && data.status === "ok") {
+      state.me = { user: data.user, auth: "local" };
+      return enterApp();
+    }
+    if (status === 429) {
+      return showTotpMsg(`Demasiados intentos. Espera ${data.retry_after ?? 60} s.`, true);
+    }
+    showTotpMsg("Código incorrecto.", true);
+    $("login-totp-code").select();
+  } catch {
+    showTotpMsg("No hay conexión con el servidor.", true);
+  } finally {
+    $("login-totp-submit").disabled = false;
+  }
+}
+
+function showTotpMsg(text, isErr) {
+  const el = $("login-totp-msg");
+  el.textContent = text;
+  el.classList.toggle("is-error", !!isErr);
+}
+
+async function doLogout() {
+  try { await authPost("api/auth/logout"); } catch { /* the cookie dies anyway */ }
+  state.me = null;
+  showLogin();
 }
 
 const nf = new Intl.NumberFormat("es-ES");
@@ -1159,6 +1299,7 @@ const FOCUSABLE_SELECTOR = "button, [href], input, select, textarea, [tabindex]:
 // has to move into the dialog, stay there while it is open, and come back to
 // the button that opened it.
 async function openSettings() {
+  renderAuthSections();  // admin-only sections; fire and forget
   $("settings-overlay").hidden = false;
   setSettingsMsg("");
   $("settings-save").disabled = true;
@@ -1280,7 +1421,8 @@ async function saveSettings() {
     setSettingsMsg("Guardado.");
     setTimeout(closeSettings, 400);
   } catch (e) {
-    setSettingsMsg(`Error al guardar: ${e.message}`, true);
+    if (isAuthError(e)) return;
+    setSettingsMsg(`Error al guardar: ${e.message === "forbidden" ? "Necesitas permisos de administrador." : e.message}`, true);
   } finally {
     $("settings-save").disabled = false;
   }
@@ -1330,11 +1472,258 @@ function initSettings() {
 
 window.addEventListener("popstate", applyHash);
 
-(async () => {
-  initSettings();
-  await Promise.all([loadStats(), loadWorkflows()]);
-  await applyBrand();
-  await applyHash();
-  // Show the last sync, and follow one that is already running (e.g. the scheduled one).
-  watchSync({ refresh: false });
-})();
+// ---------- admin: users + own 2FA (T10) ----------
+
+let settingsAuthRendered = false;
+
+function isAdmin() {
+  return !!(state.me && state.me.user && state.me.user.role === "admin");
+}
+
+function authMsg(text, isErr) {
+  const el = $("users-msg");
+  el.textContent = text;
+  el.classList.toggle("is-error", !!isErr);
+}
+
+function friendly(err) {
+  if (err && err.status === 403) return "Necesitas permisos de administrador.";
+  return err?.message ?? String(err);
+}
+
+async function renderAuthSections() {
+  const admin = isAdmin();
+  $("sec-users").hidden = !admin;
+  $("sec-totp").hidden = !admin;
+  if (!admin) return;
+  await renderUsers();
+  renderTotpSection();
+}
+
+async function renderUsers() {
+  const box = $("users-list");
+  setChildren(box);
+  let users;
+  try {
+    users = await api("/api/users");
+  } catch (e) {
+    if (!isAuthError(e)) authMsg(friendly(e), true);
+    return;
+  }
+  for (const u of users) {
+    const row = el("div", { class: "user-row" },
+      el("span", { class: "user-name", text: u.name }),
+      el("span", { class: "user-role", text: u.role === "admin" ? "admin" : "viewer" }),
+      u.totp_enabled ? el("span", { class: "user-totp", text: "2FA" }) : null,
+      u.disabled ? el("span", { class: "user-off", text: "desactivado" }) : null,
+      el("span", { class: "user-last", text: u.last_login ? fmtDate(u.last_login) : "—" }),
+    );
+    const acts = el("div", { class: "user-acts" });
+    const act = (label, fn, confirmMsg) => {
+      const b = el("button", { class: "btn btn-ghost btn-sm", text: label });
+      b.addEventListener("click", async () => {
+        if (confirmMsg && !confirm(confirmMsg)) return;
+        b.disabled = true;
+        try {
+          await fn();
+          authMsg("");
+          await renderUsers();
+        } catch (e) {
+          if (!isAuthError(e)) authMsg(friendly(e), true);
+          b.disabled = false;
+        }
+      });
+      return b;
+    };
+    if (u.role === "admin") {
+      acts.append(act("Pasar a viewer", () =>
+        authSend("PATCH", `api/users/${encodeURIComponent(u.name)}`, { role: "viewer" }).then((r) => {
+          if (r.status !== 200) throw new Error(r.data.error ?? `HTTP ${r.status}`);
+        }), "¿Quitar permisos de admin a este usuario?"));
+    } else {
+      acts.append(act("Pasar a admin", () =>
+        authSend("PATCH", `api/users/${encodeURIComponent(u.name)}`, { role: "admin" }).then((r) => {
+          if (r.status !== 200) throw new Error(r.data.error ?? `HTTP ${r.status}`);
+        }), "¿Dar permisos de admin a este usuario?"));
+    }
+    acts.append(act(u.disabled ? "Activar" : "Desactivar", () =>
+      authSend("PATCH", `api/users/${encodeURIComponent(u.name)}`, { disabled: !u.disabled }).then((r) => {
+        if (r.status !== 200) throw new Error(r.data.error ?? `HTTP ${r.status}`);
+      })));
+    acts.append(act("Eliminar", () =>
+      authSend("DELETE", `api/users/${encodeURIComponent(u.name)}`).then((r) => {
+        if (r.status !== 200) throw new Error(r.data.error ?? `HTTP ${r.status}`);
+      }), `¿Eliminar la cuenta ${u.name}? Esta acción no se puede deshacer.`));
+    row.append(acts);
+    box.append(row);
+  }
+}
+
+function renderTotpSection() {
+  const area = $("totp-area");
+  setChildren(area);
+  const enabled = !!(state.me?.user?.totp_enabled);
+  if (enabled) {
+    const input = el("input", { class: "totp-input", inputmode: "numeric",
+      maxlength: "6", placeholder: "000000", autocomplete: "one-time-code" });
+    const btn = el("button", { class: "btn btn-ghost btn-sm", text: "Desactivar 2FA" });
+    btn.addEventListener("click", async () => {
+      if (!confirm("¿Desactivar la verificación en dos pasos de tu cuenta?")) return;
+      btn.disabled = true;
+      try {
+        const r = await authPost("api/auth/totp/disable", { code: input.value.trim() });
+        if (r.status !== 200) throw new Error(r.data.error ?? `HTTP ${r.status}`);
+        state.me.user.totp_enabled = false;
+        renderTotpSection();
+      } catch (e) {
+        authMsg(e.status === 401 ? "Código incorrecto." : friendly(e), true);
+        btn.disabled = false;
+      }
+    });
+    area.append(el("p", { class: "set-hint", text: "Tu cuenta usa verificación en dos pasos." }),
+      el("div", { class: "login-actions" }, input, btn));
+    input.focus();
+    return;
+  }
+  const btn = el("button", { class: "btn btn-ghost btn-sm", text: "Activar 2FA" });
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try {
+      const setup = await api("/api/auth/totp/setup");
+      renderTotpSetup(area, setup);
+    } catch (e) {
+      if (!isAuthError(e)) authMsg(friendly(e), true);
+      btn.disabled = false;
+    }
+  });
+  area.append(el("p", { class: "set-hint",
+    text: "Añade una segunda capa: un código de 6 dígitos de tu móvil en cada inicio de sesión." }), btn);
+}
+
+function renderTotpSetup(area, setup) {
+  setChildren(area);
+  // QR: every module becomes an <rect> attribute — no string HTML, no
+  // untrusted data anywhere near a markup sink
+  const qr = qrcodegen.QrCode.encodeText(setup.otpauth_uri, qrcodegen.QrCode.Ecc.MEDIUM);
+  const n = qr.size;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${n} ${n}`);
+  svg.setAttribute("class", "totp-qr");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "Código QR para tu app de autenticación");
+  const bg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+  bg.setAttribute("width", n); bg.setAttribute("height", n); bg.setAttribute("fill", "#fff");
+  svg.append(bg);
+  const fg = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  fg.setAttribute("fill", "#111");
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      if (!qr.getModule(x, y)) continue;
+      const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      r.setAttribute("x", x); r.setAttribute("y", y);
+      r.setAttribute("width", 1); r.setAttribute("height", 1);
+      fg.append(r);
+    }
+  }
+  svg.append(fg);
+  const secret = el("code", { class: "totp-secret", text: setup.secret });
+  const input = el("input", { class: "totp-input", inputmode: "numeric", maxlength: "6",
+    placeholder: "000000", autocomplete: "one-time-code" });
+  const btn = el("button", { class: "btn btn-primary btn-sm", text: "Activar" });
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try {
+      const r = await authPost("api/auth/totp/enable", { code: input.value.trim() });
+      if (r.status !== 200) throw new Error(r.data.error ?? `HTTP ${r.status}`);
+      state.me.user.totp_enabled = true;
+      renderTotpSection();
+    } catch (e) {
+      authMsg(e.status === 401 ? "Código incorrecto, inténtalo de nuevo." : friendly(e), true);
+      btn.disabled = false;
+    }
+  });
+  area.append(svg,
+    el("p", { class: "set-hint", text: "Escanea con Google Authenticator, Aegis o similar, o pega la clave a mano:" }),
+    secret, el("div", { class: "login-actions" }, input, btn));
+}
+
+function wireAuth() {
+  $("login-submit").addEventListener("click", doLogin);
+  $("login-pass").addEventListener("keydown", (ev) => { if (ev.key === "Enter") doLogin(); });
+  $("login-user").addEventListener("keydown", (ev) => { if (ev.key === "Enter") doLogin(); });
+  $("login-totp-submit").addEventListener("click", doTotp);
+  $("login-totp-code").addEventListener("keydown", (ev) => { if (ev.key === "Enter") doTotp(); });
+  $("login-totp-code").addEventListener("input", (ev) => {
+    if (ev.target.value.replace(/\D/g, "").length === 6) doTotp();
+  });
+  $("login-first").addEventListener("click", () => {
+    $("login-step-credentials").hidden = true;
+    $("login-step-first").hidden = false;
+    $("first-user").focus();
+  });
+  $("first-cancel").addEventListener("click", () => {
+    $("login-step-first").hidden = true;
+    $("login-step-credentials").hidden = false;
+  });
+  $("first-submit").addEventListener("click", async () => {
+    const username = $("first-user").value.trim();
+    const password = $("first-pass").value;
+    if (password.length < 8) return showFirstMsg("La contraseña necesita al menos 8 caracteres.", true);
+    if (password !== $("first-pass2").value) return showFirstMsg("Las contraseñas no coinciden.", true);
+    $("first-submit").disabled = true;
+    try {
+      const { status, data } = await authPost("api/auth/bootstrap", { username, password });
+      if (status === 200 && data.status === "ok") {
+        state.me = { user: data.user, auth: "local" };
+        return enterApp();
+      }
+      if (status === 403) {
+        $("login-step-first").hidden = true;
+        $("login-step-credentials").hidden = false;
+        return showLoginMsg("Ya existe una cuenta: inicia sesión.", true);
+      }
+      showFirstMsg(data.error ?? `HTTP ${status}`, true);
+    } catch {
+      showFirstMsg("No hay conexión con el servidor.", true);
+    } finally {
+      $("first-submit").disabled = false;
+    }
+  });
+  $("logout-btn").addEventListener("click", doLogout);
+  $("user-new-add").addEventListener("click", async () => {
+    const username = $("user-new-name").value.trim();
+    const password = $("user-new-pass").value;
+    const role = $("user-new-role").value;
+    try {
+      const r = await authSend("POST", "api/users", { username, password, role });
+      if (r.status !== 200) throw new Error(r.data.error ?? `HTTP ${r.status}`);
+      $("user-new-name").value = ""; $("user-new-pass").value = "";
+      authMsg("");
+      await renderUsers();
+    } catch (e) {
+      if (!isAuthError(e)) authMsg(friendly(e), true);
+    }
+  });
+}
+
+function showFirstMsg(text, isErr) {
+  const elx = $("first-msg");
+  elx.textContent = text;
+  elx.classList.toggle("is-error", !!isErr);
+}
+
+let appStarted = false;
+async function startApp() {
+  wireAuth();
+  try {
+    state.me = await api("/api/auth/me");
+  } catch (e) {
+    if (e.status === 401) return showLogin();
+    throw e;
+  }
+  if (appStarted) return;
+  appStarted = true;
+  await enterApp();
+}
+
+startApp();

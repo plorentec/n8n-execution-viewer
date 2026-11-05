@@ -32,6 +32,9 @@
   </div>
   <div class="header-right">
     <a class="btn btn-ghost btn-sm" href="docs.html" title="Documentación de instalación y despliegue" style="text-decoration:none">Docs</a>
+    <button id="logout-btn" class="theme-toggle" type="button" title="Cerrar sesión" aria-label="Cerrar sesión" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+    </button>
     <div class="live"><span class="live-dot" id="live-dot"></span> <span id="live-txt" aria-live="polite">Cargando…</span></div>
     <button id="sync-btn" class="btn btn-primary btn-sm" type="button" title="Ejecutar el flujo de copia de n8n e integrar la copia nueva en el histórico">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16M3 12a9 9 0 0 1 15.5-6.2L21 8M21 3v5h-5M3 21v-5h5"/></svg>
@@ -235,6 +238,24 @@
       </label>
       <p class="set-hint">Dejar un campo vacío vuelve al valor por defecto.</p>
     </section>
+    <section class="set-section" id="sec-totp" hidden>
+      <h3>Mi 2FA</h3>
+      <div id="totp-area"></div>
+    </section>
+    <section class="set-section" id="sec-users" hidden>
+      <h3>Usuarios</h3>
+      <div id="users-list"></div>
+      <div class="user-new">
+        <input id="user-new-name" type="text" placeholder="usuario" autocomplete="off">
+        <input id="user-new-pass" type="password" placeholder="contraseña (min 8)">
+        <select id="user-new-role">
+          <option value="viewer">Viewer</option>
+          <option value="admin">Admin</option>
+        </select>
+        <button id="user-new-add" class="btn btn-ghost btn-sm" type="button">Añadir</button>
+      </div>
+      <p class="set-hint" id="users-msg" aria-live="polite"></p>
+    </section>
     <div class="modal-foot">
       <span id="settings-msg" class="settings-msg" aria-live="polite"></span>
       <button id="settings-save" class="btn btn-primary" type="button">Guardar</button>
@@ -242,6 +263,54 @@
   </div>
 </div>
 
+<div id="login-overlay" class="overlay" hidden>
+  <div class="modal login-modal" role="dialog" aria-modal="true" aria-label="Iniciar sesión">
+    <div class="modal-head">
+      <h2 id="login-title">Iniciar sesión</h2>
+    </div>
+    <section id="login-step-credentials">
+      <div class="login-grid">
+        <label class="lbl" for="login-user">Usuario</label>
+        <input id="login-user" type="text" autocomplete="username">
+        <label class="lbl" for="login-pass">Contraseña</label>
+        <input id="login-pass" type="password" autocomplete="current-password">
+      </div>
+      <div class="login-actions">
+        <button id="login-submit" class="btn btn-primary" type="button">Iniciar sesión</button>
+        <a id="login-oidc" class="btn btn-ghost" href="api/auth/oidc/start" hidden>Entrar con Keycloak</a>
+      </div>
+      <p id="login-msg" class="settings-msg" aria-live="polite"></p>
+      <button id="login-first" class="linklike" type="button">Configurar por primera vez</button>
+    </section>
+    <section id="login-step-totp" hidden>
+      <p class="set-hint">Introduce el código de 6 dígitos de tu app de autenticación.</p>
+      <div class="login-actions">
+        <input id="login-totp-code" class="totp-input" inputmode="numeric" maxlength="6"
+               autocomplete="one-time-code" placeholder="000000">
+        <button id="login-totp-submit" class="btn btn-primary" type="button">Verificar</button>
+      </div>
+      <p id="login-totp-msg" class="settings-msg" aria-live="polite"></p>
+    </section>
+    <section id="login-step-first" hidden>
+      <p class="set-hint">Primer arranque: crea la cuenta de administrador del visor.</p>
+      <div class="login-grid">
+        <label class="lbl" for="first-user">Usuario admin</label>
+        <input id="first-user" type="text" autocomplete="username">
+        <label class="lbl" for="first-pass">Contraseña</label>
+        <input id="first-pass" type="password" autocomplete="new-password">
+        <label class="lbl" for="first-pass2">Repite la contraseña</label>
+        <input id="first-pass2" type="password" autocomplete="new-password">
+      </div>
+      <div class="login-actions">
+        <button id="first-submit" class="btn btn-primary" type="button">Crear administrador</button>
+        <button id="first-cancel" class="btn btn-ghost" type="button">Volver</button>
+      </div>
+      <p id="first-msg" class="settings-msg" aria-live="polite"></p>
+    </section>
+  </div>
+</div>
+
+<script src="vendor/qrcodegen.js"></script>
 <script type="module" src="app.js"></script>
 </body>
 </html>
